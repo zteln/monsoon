@@ -1,23 +1,33 @@
 defmodule Monsoon.Log do
   @moduledoc """
-  root_ptr_block:
-  | type::16-bit | root_position::32-bit |
+  commit_block:
+  | (type::16-bit | root_loc::32-bit | leaf_links_loc::32-bit | metadata_loc::32-bit) |
 
   node_block:
-  | type::16-bit | node-size::32-bit | node |
+  | (type::16-bit | id::64-bit | node-size::32-bit) | node |
+
+  leaf_links_block:
+  | (type::16-bit | size::32-bit) | leaf_links |
 
   metadata_block:
-  | type::16-bit | metadata-size::32-bit | metadata |
+  | (type::16-bit | size::32-bit) | metadata |
   """
 
   alias Monsoon.BTree
 
-  @root_ptr_block_size byte_size(<<0::integer-16, 0::integer-32>>)
+  @commit_block_size 32
   @node_block_size 1024
-  @node_block_header_size 6
-  @root_ptr_block_key 0xFAFA
-  @node_block_key 0xFBFB
-  # @metadata_block_key 0xFCFC
+  @leaf_links_block_size 512
+  @metadata_block_size 512
+
+  @commit_header_size byte_size(<<0::integer-16, 0::integer-32, 0::integer-32, 0::integer-32>>)
+  @node_header_size byte_size(<<0::integer-16, 0::unsigned-integer-64, 0::integer-32>>)
+  @leaf_links_header_size byte_size(<<0::integer-16, 0::integer-32>>)
+
+  @commit_key 0xFAFA
+  @node_key 0xFBFB
+  @leaf_links_key 0xFCFC
+  @metadata_key 0xFDFD
 
   defstruct [
     :pid,
@@ -44,25 +54,18 @@ defmodule Monsoon.Log do
     end
   end
 
-  def stop(log) do
-    Agent.stop(log.pid)
-  end
+  def move(from, to) do
+    :ok = :file.rename(to.file_path, from.file_path)
+    :ok = Agent.stop(from.pid)
 
-  def rename(log, prev_log) do
-    :ok = :file.rename(log.file_path, prev_log.file_path)
+    :ok =
+      Agent.update(to.pid, fn state ->
+        del_lock(to.file_path)
+        set_lock(from.file_path)
+        state
+      end)
 
-    Agent.update(prev_log.pid, fn state ->
-      del_lock(prev_log.file_path)
-      state
-    end)
-
-    Agent.update(log.pid, fn state ->
-      del_lock(log.file_path)
-      set_lock(prev_log.file_path)
-      state
-    end)
-
-    %{log | file_path: prev_log.file_path}
+    %{to | file_path: from.file_path}
   end
 
   defp set_lock(file_path) do
@@ -77,32 +80,38 @@ defmodule Monsoon.Log do
   defp init(file_path) do
     with {:ok, file} <- :file.open(file_path, [:binary, :read, :raw, :append]),
          {:ok, position} <- :file.position(file, :eof) do
-      %{file: file, position: position}
+      %{file: file, position: position, id_cache: %{}}
     end
   end
 
-  @spec latest_root_location(log :: t()) :: {:ok, nil | non_neg_integer()} | {:error, term()}
-  def latest_root_location(log) do
+  @spec get_commit(log :: t()) :: {:ok, nil | non_neg_integer()} | {:error, term()}
+  def get_commit(log) do
     Agent.get(log.pid, fn state ->
-      read_latest_root_ptr_block(state.file, state.position)
+      read_latest_commit_block(state.file, state.position)
     end)
   end
 
-  defp read_latest_root_ptr_block(file, position) do
-    position = max(position - @root_ptr_block_size, 0)
+  defp read_latest_commit_block(file, position) do
+    position = max(position - @commit_block_size, 0)
 
-    case :file.pread(file, position, @root_ptr_block_size) do
+    case :file.pread(file, position, @commit_header_size) do
       :eof ->
         {:ok, nil}
 
-      {:ok, <<@root_ptr_block_key::integer-16, root_loc::integer-32>>} ->
-        {:ok, root_loc}
+      {:ok,
+       <<
+         @commit_key::integer-16,
+         root_loc::integer-32,
+         leaf_links_loc::integer-32,
+         metadata_loc::integer-32
+       >>} ->
+        {:ok, {root_loc, leaf_links_loc, metadata_loc}}
 
       {:ok, _} when position == 0 ->
         {:ok, nil}
 
       {:ok, _} ->
-        read_latest_root_ptr_block(file, position)
+        read_latest_commit_block(file, position)
 
       {:error, _reason} = error ->
         error
@@ -110,10 +119,18 @@ defmodule Monsoon.Log do
   end
 
   @spec put_node(log :: t(), node :: BTree.t()) :: {:ok, location :: non_neg_integer()}
-  def put_node(log, node) do
+  def put_node(log, %BTree.Leaf{} = node) do
     Agent.get_and_update(log.pid, fn state ->
-      {:ok, node_loc, position} = write_node(state.file, state.position, node)
-      {{:ok, node_loc}, %{state | position: position}}
+      {:ok, position} = write_node(state.file, state.position, node)
+      id_cache = Map.put(state.id_cache, Map.get(node, :id), state.position)
+      {{:ok, state.position}, %{state | position: position, id_cache: id_cache}}
+    end)
+  end
+
+  def put_node(log, %BTree.Interior{} = node) do
+    Agent.get_and_update(log.pid, fn state ->
+      {:ok, position} = write_node(state.file, state.position, node)
+      {{:ok, state.position}, %{state | position: position}}
     end)
   end
 
@@ -121,63 +138,167 @@ defmodule Monsoon.Log do
     block = encode_node_block(node)
 
     with :ok <- :file.pwrite(file, loc, block) do
-      # :ok <- :file.datasync(file) do
-      write_loc = loc
       loc = loc + byte_size(block)
-      {:ok, write_loc, loc}
+      {:ok, loc}
+    end
+  end
+
+  def get_node_by_id(log, id) do
+    Agent.get(log.pid, fn state ->
+      block =
+        case Map.get(state.id_cache, id) do
+          nil ->
+            # traverse
+            {:ok, block} = read_node_from_id(state.file, state.position, id)
+            block
+
+          loc ->
+            {:ok, block} = read_node_from_loc(state.file, loc)
+            block
+        end
+
+      {:ok, decode_node_block(block)}
+    end)
+  end
+
+  defp read_node_from_id(file, position, id) do
+    position = max(position - @node_block_size, 0)
+
+    case :file.pread(file, position, @node_header_size) do
+      :eof ->
+        {:ok, nil}
+
+      {:ok, <<@node_key::integer-16, ^id::binary-size(8), size::integer-32>>} ->
+        block_size =
+          no_of_blocks(@node_header_size + size, @node_block_size) * @node_block_size
+
+        :file.pread(
+          file,
+          position,
+          block_size
+        )
+
+      {:ok, _} when position == 0 ->
+        {:ok, nil}
+
+      {:ok, _} ->
+        read_node_from_id(file, position, id)
+
+      {:error, _reason} = e ->
+        e
     end
   end
 
   @spec get_node(log :: t(), loc :: non_neg_integer()) :: {:ok, BTree.t()}
   def get_node(log, loc) do
     Agent.get(log.pid, fn state ->
-      read_node_from_loc(state.file, loc)
+      {:ok, block} = read_node_from_loc(state.file, loc)
+      {:ok, decode_node_block(block)}
     end)
   end
 
   defp read_node_from_loc(file, loc) do
-    {:ok, <<@node_block_key::integer-16, size::integer-32>>} =
-      :file.pread(file, loc, @node_block_header_size)
+    {:ok, <<@node_key::integer-16, _id::binary-size(8), size::integer-32>>} =
+      :file.pread(file, loc, @node_header_size)
 
-    {:ok, block} =
-      :file.pread(file, loc, no_of_blocks(@node_block_header_size + size) * @node_block_size)
+    block_size = no_of_blocks(@node_header_size + size, @node_block_size) * @node_block_size
 
-    {:ok, decode_node_block(block)}
+    :file.pread(file, loc, block_size)
   end
 
   @spec commit(log :: t(), root_loc :: non_neg_integer()) :: :ok
-  def commit(log, root_loc) do
+  def commit(log, {root_loc, leaf_links_loc, metadata_loc}) do
     Agent.update(log.pid, fn state ->
-      {:ok, position} = write_root_ptr(state.file, state.position, root_loc)
+      {:ok, position} =
+        write_commit(state.file, state.position, {root_loc, leaf_links_loc, metadata_loc})
+
       %{state | position: position}
     end)
   end
 
-  defp write_root_ptr(file, position, root_loc) do
-    block = <<@root_ptr_block_key::integer-16, root_loc::integer-32>>
+  defp write_commit(file, position, {root_loc, leaf_links_loc, metadata_loc}) do
+    block =
+      <<
+        @commit_key::integer-16,
+        root_loc::integer-32,
+        leaf_links_loc::integer-32,
+        metadata_loc::integer-32,
+        0::size(@commit_block_size - @commit_header_size)-unit(8)
+      >>
 
     with :ok <- :file.pwrite(file, position, block),
          :ok <- :file.datasync(file) do
-      {:ok, position + @root_ptr_block_size}
+      {:ok, position + @commit_block_size}
     end
   end
 
+  @spec put_leaf_links(log :: t(), dll :: map()) :: :ok
+  def put_leaf_links(log, leaf_ptrs) do
+    Agent.get_and_update(log.pid, fn state ->
+      {:ok, position} = write_leaf_ptrs(state.file, state.position, leaf_ptrs)
+      {{:ok, state.position}, %{state | position: position}}
+    end)
+  end
+
+  defp write_leaf_ptrs(file, position, leaf_ptrs) do
+    block = encode_leaf_links_block(leaf_ptrs)
+
+    with :ok <- :file.pwrite(file, position, block) do
+      {:ok, position + byte_size(block)}
+    end
+  end
+
+  @spec get_leaf_links(log :: t(), leaf_links_loc :: non_neg_integer()) :: {:ok, map()}
+  def get_leaf_links(log, leaf_links_loc) do
+    Agent.get(log.pid, fn state ->
+      {:ok, block} = read_leaf_links_block(state.file, leaf_links_loc)
+      {:ok, decode_leaf_links_block(block)}
+    end)
+  end
+
+  defp read_leaf_links_block(file, loc) do
+    {:ok, <<@leaf_links_key::integer-16, size::integer-32>>} =
+      :file.pread(file, loc, @leaf_links_header_size)
+
+    block_size =
+      no_of_blocks(@leaf_links_header_size + size, @leaf_links_block_size) *
+        @leaf_links_block_size
+
+    :file.pread(file, loc, block_size)
+  end
+
   defp encode_node_block(node) do
+    id = if Map.has_key?(node, :id), do: Map.get(node, :id), else: <<0::unsigned-integer-64>>
     enc = :erlang.term_to_binary(node)
     node_size = byte_size(enc)
-    block_size = byte_size(<<0::integer-16, 0::integer-32, enc::binary>>)
-    no_of_blocks = no_of_blocks(block_size)
-    content = <<@node_block_key::integer-16, node_size::integer-32, enc::binary>>
+    block_size = byte_size(<<0::integer-16, 0::integer-64, 0::integer-32, enc::binary>>)
+    no_of_blocks = no_of_blocks(block_size, @node_block_size)
+    content = <<@node_key::integer-16, id::binary, node_size::integer-32, enc::binary>>
     padding_size = no_of_blocks * @node_block_size - block_size
     <<content::binary, 0::size(padding_size)-unit(8)>>
   end
 
   defp decode_node_block(block) do
-    <<@node_block_key::integer-16, _size::integer-32, bin::binary>> = block
+    <<@node_key::integer-16, _id::binary-size(8), _size::integer-32, bin::binary>> = block
     :erlang.binary_to_term(bin)
   end
 
-  defp no_of_blocks(size) do
-    div(size + @node_block_size - 1, @node_block_size)
+  defp encode_leaf_links_block(ptrs) do
+    enc = :erlang.term_to_binary(ptrs)
+    ptrs_size = byte_size(enc)
+    ptrs_block_size = byte_size(<<0::integer-16, 0::integer-32, enc::binary>>)
+    no_of_blocks = no_of_blocks(ptrs_block_size, @leaf_links_block_size)
+    content = <<@leaf_links_key::integer-16, ptrs_size::integer-32, enc::binary>>
+    padding_size = no_of_blocks * @leaf_links_block_size - ptrs_block_size
+    <<content::binary, 0::size(padding_size)-unit(8)>>
+  end
+
+  defp decode_leaf_links_block(block) do
+    <<@leaf_links_key::integer-16, _size::integer-32, enc::binary>> = block
+    :erlang.binary_to_term(enc)
+  end
+
+  defp no_of_blocks(size, unit) do
+    div(size + unit - 1, unit)
   end
 end

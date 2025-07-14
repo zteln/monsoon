@@ -1,104 +1,68 @@
 defmodule Monsoon.BTree.Search do
+  alias Monsoon.BTree.{Leaf, Interior, Util}
   alias Monsoon.Log
 
-  @spec search_key(log :: GenServer.server(), node :: Monsoon.BTree.t(), key :: term) ::
-          {:ok, term()} | {:error, nil | term()}
-  def search_key(_log, %{is_leaf: true} = node, key) do
-    case Enum.find(node.pairs, fn {k, _v} -> k == key end) do
-      nil ->
-        {:error, nil}
-
-      {_k, v} ->
-        {:ok, v}
-    end
+  def search_key(%Leaf{} = node, key, _log) do
+    find_kv(node.keys, node.values, key)
   end
 
-  def search_key(log, node, key) do
-    node.pairs
-    |> Enum.with_index()
-    |> Enum.reduce_while(0, fn
-      {{k, v}, _idx}, _acc when k == key ->
-        {:halt, {:ok, v}}
-
-      {{k, _v}, idx}, _acc when k > key ->
-        child_pos = Enum.at(node.children, idx)
-
-        res =
-          with {:ok, child} <- Log.get_node(log, child_pos) do
-            search_key(log, child, key)
-          end
-
-        {:halt, res}
-
-      {{k, _v}, idx}, _acc when k < key ->
-        {:cont, idx + 1}
-    end)
-    |> case do
-      idx when is_number(idx) ->
-        child_pos = Enum.at(node.children, idx)
-
-        with {:ok, child} <- Log.get_node(log, child_pos) do
-          search_key(log, child, key)
-        end
-
-      res ->
-        res
-    end
+  def search_key(%Interior{} = node, key, log) do
+    child_idx = Util.find_child_index(node.keys, key)
+    child_loc = Enum.at(node.children, child_idx)
+    {:ok, child} = Log.get_node(log, child_loc)
+    search_key(child, key, log)
   end
 
-  # @spec select_keys(
-  #         log :: GenServer.server(),
-  #         node :: BTree.t(),
-  #         lower :: term(),
-  #         upper :: term(),
-  #         acc :: list()
-  #       ) :: list()
-  # def select_keys(_log, _node, _lower, _upper, {:error, _} = acc), do: acc
+  defp find_kv([], [], _key), do: nil
+  defp find_kv([k | _ks], [_v | _vs], key) when key < k, do: nil
+  defp find_kv([k | ks], [_v | vs], key) when key > k, do: find_kv(ks, vs, key)
+  defp find_kv([k | _ks], [v | _vs], key) when k == key, do: v
+  # defp to_list(nil, _lower, _upper, _log), do: []
+  # defp to_list(%Leaf{} = node, nil, nil, _log), do: Enum.zip(node.keys, node.values)
   #
-  # def select_keys(_log, %{is_leaf: true} = node, lower, upper, acc) do
-  #   Enum.reduce(node.pairs, acc, fn
-  #     {k, v}, acc ->
-  #       if k >= lower and k <= upper do
-  #         [{k, v} | acc]
-  #       else
-  #         acc
+  # defp to_list(%Leaf{} = node, lower, upper, _log) do
+  #   Enum.zip(node.keys, node.values)
+  #   |> Enum.filter(fn {k, _v} -> k >= lower and k <= upper end)
+  # end
+  #
+  # defp to_list(%Interior{} = node, lower, upper, log) do
+  #   zip(node.children, node.keys, lower, upper)
+  #   |> Enum.flat_map(fn {child_pos, pair} ->
+  #     child =
+  #       case Log.get_node(log, child_pos) do
+  #         {:ok, child} ->
+  #           child
+  #
+  #         {:error, reason} ->
+  #           raise "Failed to get node, reason: #{inspect(reason)}."
   #       end
+  #
+  #     child_elements = to_list(log, child, lower, upper)
+  #     if pair, do: child_elements ++ [pair], else: child_elements
   #   end)
   # end
   #
-  # def select_keys(log, node, lower, upper, acc) do
-  #   pairs_len = length(node.pairs)
-  #
-  #   node.pairs
-  #   |> Enum.with_index()
-  #   |> Enum.reduce(acc, fn
-  #     _, {:error, _} = acc ->
-  #       acc
-  #
-  #     {{k, _v}, _idx}, acc when k < lower ->
-  #       acc
-  #
-  #     {{k, v}, idx}, acc when k > upper ->
-  #       with {:ok, child} <- get_child(log, node, idx) do
-  #         select_keys(log, child, lower, upper, [{k, v} | acc])
-  #       end
-  #
-  #     {{k, v}, idx}, acc when idx == pairs_len - 1 ->
-  #       with {:ok, child} <- get_child(log, node, idx),
-  #            {:ok, last_child} <- get_child(log, node, idx + 1) do
-  #         acc = select_keys(log, child, lower, upper, [{k, v} | acc])
-  #         select_keys(log, last_child, lower, upper, acc)
-  #       end
-  #
-  #     {{k, v}, idx}, acc ->
-  #       with {:ok, child} <- get_child(log, node, idx) do
-  #         select_keys(log, child, lower, upper, [{k, v} | acc])
-  #       end
-  #   end)
+  # defp zip(l1, l2, nil, nil) do
+  #   Enum.zip(l1, l2 ++ [nil])
   # end
   #
-  # defp get_child(log, node, idx) do
-  #   child_pos = Enum.at(node.children, idx)
-  #   Log.get_node(log, child_pos)
+  # defp zip(l1, l2, lower, upper) do
+  #   zip_range(l1, l2, lower, upper, [])
+  #   |> Enum.reverse()
+  # end
+  #
+  # defp zip_range([last], [], _lower, _upper, acc), do: [{last, nil} | acc]
+  #
+  # defp zip_range([el1 | l1], [{k, v} | l2], lower, upper, acc) do
+  #   cond do
+  #     k > upper ->
+  #       acc
+  #
+  #     k < lower ->
+  #       zip_range(l1, l2, lower, upper, acc)
+  #
+  #     true ->
+  #       zip_range(l1, l2, lower, upper, [{el1, {k, v}} | acc])
+  #   end
   # end
 end

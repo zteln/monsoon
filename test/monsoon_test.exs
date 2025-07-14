@@ -13,109 +13,191 @@ defmodule MonsoonTest do
 
   describe "start_link/1" do
     test "writes empty root to file", c do
-      %{log: log, root_cursor: root_cursor} = :sys.get_state(c.db)
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
 
-      assert {:ok, %BTree{is_leaf: true, pairs: [], children: []}} =
-               Log.get_node(log, root_cursor)
+      assert {:ok, %BTree.Leaf{keys: [], values: []}} =
+               Log.get_node(log, root_loc)
     end
   end
 
-  describe "put/3" do
-    test "writes key-value to b-tree", c do
+  describe "add/3" do
+    test "inserts into empty b-tree", c do
       assert :ok == Monsoon.put(c.db, :k, :v)
 
-      %{log: log, root_cursor: root_cursor} = :sys.get_state(c.db)
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
 
-      assert {:ok, %BTree{is_leaf: true, pairs: [{:k, :v}], children: []}} =
-               Log.get_node(log, root_cursor)
-    end
-  end
-
-  describe "get/2" do
-    test "gets written key", c do
-      assert :ok == Monsoon.put(c.db, :k, :v)
-      assert {:ok, :v} == Monsoon.get(c.db, :k)
-    end
-  end
-
-  describe "transaction" do
-    test "start_transaction/1 can read inserted pairs", c do
-      assert :ok == Monsoon.start_transaction(c.db)
-      assert :ok == Monsoon.put(c.db, :k, :v)
-      assert {:ok, :v} == Monsoon.get(c.db, :k)
-      assert :ok == Monsoon.end_transaction(c.db)
-      assert {:ok, :v} == Monsoon.get(c.db, :k)
+      assert {:ok, %BTree.Leaf{keys: [:k], values: [:v]}} =
+               Log.get_node(log, root_loc)
     end
 
-    test "cancel_transaction cannot read pairs inserted during transaction", c do
-      assert :ok == Monsoon.start_transaction(c.db)
-      assert :ok == Monsoon.put(c.db, :k, :v)
-      assert {:ok, :v} == Monsoon.get(c.db, :k)
-      assert :ok == Monsoon.cancel_transaction(c.db)
-      assert {:error, nil} == Monsoon.get(c.db, :k)
+    test "already added key updates value", c do
+      assert :ok == Monsoon.put(c.db, :k, :v1)
+      assert :v1 == Monsoon.get(c.db, :k)
+      assert :ok == Monsoon.put(c.db, :k, :v2)
+      assert :v2 == Monsoon.get(c.db, :k)
     end
-  end
 
-  describe "cleans file" do
-    test "when gen_limit is reached", c do
-      pairs =
-        for n <- 0..10 do
-          {n, :"v#{n}"}
-        end
+    test "splits b-tree root", c do
+      for n <- 0..4 do
+        assert :ok == Monsoon.put(c.db, n, "A-#{n}")
+      end
 
-      Enum.each(pairs, fn {k, v} ->
-        assert :ok == Monsoon.put(c.db, k, v)
-      end)
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
 
-      Enum.each(pairs, fn {k, v} ->
-        assert {:ok, v} == Monsoon.get(c.db, k)
-      end)
+      assert {:ok, %BTree.Interior{keys: [2], children: children}} = Log.get_node(log, root_loc)
+
+      for child_loc <- children do
+        assert {:ok, %BTree.Leaf{}} = Log.get_node(log, child_loc)
+      end
     end
   end
 
   describe "remove/2" do
+    test "removes single entry in leaf root", c do
+      Monsoon.put(c.db, :k, :v)
+      assert :ok == Monsoon.remove(c.db, :k)
+
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
+
+      assert {:ok, %BTree.Leaf{keys: [], values: []}} =
+               Log.get_node(log, root_loc)
+    end
+
+    test "can remove non-existing key", c do
+      assert :ok == Monsoon.remove(c.db, :non_existing_key)
+    end
+
+    test "rotates nodes", c do
+      for n <- 0..4 do
+        Monsoon.put(c.db, n, :"v-#{n}")
+      end
+
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
+
+      assert {:ok, %BTree.Interior{keys: [2]}} =
+               Log.get_node(log, root_loc)
+
+      assert :ok == Monsoon.remove(c.db, 1)
+
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
+
+      assert {:ok, %BTree.Interior{keys: [3]}} =
+               Log.get_node(log, root_loc)
+    end
+
+    test "merges nodes", c do
+      for n <- 0..3 do
+        Monsoon.put(c.db, n, :"v-#{n}")
+      end
+
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
+
+      assert {:ok, %BTree.Interior{keys: [2]}} =
+               Log.get_node(log, root_loc)
+
+      assert :ok == Monsoon.remove(c.db, 1)
+      assert :ok == Monsoon.remove(c.db, 2)
+
+      %{log: log, btree: {root_loc, _, _}} = :sys.get_state(c.db)
+
+      assert {:ok, %BTree.Leaf{keys: [0, 3], values: [:"v-0", :"v-3"]}} =
+               Log.get_node(log, root_loc)
+    end
+  end
+
+  describe "search/2" do
+    test "gets key in leaf", c do
+      Monsoon.put(c.db, 1, "A")
+      assert "A" == Monsoon.get(1)
+      assert nil == Monsoon.get(2)
+    end
+
+    test "gets key when depth > 1", c do
+      for n <- 0..10 do
+        Monsoon.put(c.db, n, "A-#{n}")
+      end
+
+      for n <- 0..10 do
+        assert "A-#{n}" == Monsoon.get(c.db, n)
+      end
+    end
+  end
+
+  describe "select/3" do
     setup c do
-      data = gen_data()
-      populate_db(c.db, data)
-      %{data: data}
-    end
-
-    test "key in non-minimal leaf node is removed", c do
-      assert :ok == Monsoon.remove(c.db, length(c.data))
-
-      for n <- 1..(length(c.data) - 1) do
-        assert {:ok, :"v-#{n}"} == Monsoon.get(c.db, n)
+      for n <- 0..10 do
+        Monsoon.put(c.db, n, "A-#{n}")
       end
 
-      assert {:error, nil} == Monsoon.get(c.db, length(c.data))
+      :ok
     end
 
-    test "key in minimal leaf node causes underflow", c do
-      assert :ok == Monsoon.remove(c.db, 7)
+    test "all keys", c do
+      assert for(n <- 0..10, do: {n, "A-#{n}"}) == Monsoon.select(c.db) |> Enum.to_list()
+    end
 
-      for n <- 1..length(c.data) do
-        if n == 7 do
-          assert {:error, nil} == Monsoon.get(c.db, n)
-        else
-          assert {:ok, :"v-#{n}"} == Monsoon.get(c.db, n)
-        end
-      end
+    test "a range", c do
+      assert for(n <- 3..7, do: {n, "A-#{n}"}) == Monsoon.select(c.db, 3, 7) |> Enum.to_list()
+    end
+
+    test "returns the latest", c do
+      stream = Monsoon.select(c.db)
+
+      assert for(n <- 0..10, do: {n, "A-#{n}"}) == Enum.to_list(stream)
+
+      Monsoon.put(c.db, 11, "A-#{11}")
+      Monsoon.remove(c.db, 0)
+
+      assert for(n <- 1..11, do: {n, "A-#{n}"}) == Enum.to_list(stream)
     end
   end
 
-  defp populate_db(db, data) do
-    Monsoon.start_transaction(db)
+  describe "start_transaction/1,end_transaction/1,cancel_transaction/1" do
+    test "transaction commits when done", c do
+      assert :ok == Monsoon.start_transaction(c.db)
+      assert :ok == Monsoon.put(c.db, 1, "A-1")
+      assert :ok == Monsoon.end_transaction(c.db)
+      assert "A-1" == Monsoon.get(c.db, 1)
+    end
 
-    Enum.each(data, fn {k, v} ->
-      Monsoon.put(db, k, v)
-    end)
+    test "transaction is process bound", c do
+      ref = make_ref()
+      pid = self()
 
-    Monsoon.end_transaction(db)
-  end
+      assert :ok == Monsoon.start_transaction(c.db)
+      assert :ok == Monsoon.put(c.db, 1, "A-1")
 
-  defp gen_data(size \\ 11) do
-    for n <- 1..size do
-      {n, :"v-#{n}"}
+      spawn(fn ->
+        assert nil == Monsoon.get(c.db, 1)
+        send(pid, {:done, ref})
+      end)
+
+      receive do
+        {:done, ^ref} ->
+          :ok
+      end
+
+      assert "A-1" == Monsoon.get(c.db, 1)
+      assert :ok == Monsoon.end_transaction(c.db)
+      assert "A-1" == Monsoon.get(c.db, 1)
+
+      spawn(fn ->
+        assert "A-1" == Monsoon.get(c.db, 1)
+        send(pid, {:done, ref})
+      end)
+
+      receive do
+        {:done, ^ref} ->
+          :ok
+      end
+    end
+
+    test "canceling a transaction does not update tree", c do
+      assert :ok == Monsoon.start_transaction(c.db)
+      assert :ok == Monsoon.put(c.db, 1, "A-1")
+      assert "A-1" == Monsoon.get(c.db, 1)
+      assert :ok = Monsoon.cancel_transaction(c.db)
+      assert nil == Monsoon.get(c.db, 1)
     end
   end
 end
