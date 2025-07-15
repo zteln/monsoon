@@ -55,6 +55,7 @@ defmodule Monsoon.BTree do
         {:ok, root_loc} = Log.put_node(log, root)
         {:ok, leaf_links_loc} = Log.put_leaf_links(log, leaf_ptrs)
         btree = {root_loc, leaf_links_loc, 0}
+        :ok = Log.flush(log)
         :ok = Log.commit(log, btree)
         {:ok, btree}
 
@@ -93,6 +94,7 @@ defmodule Monsoon.BTree do
     case Add.add(root, k, v, %{log: log, btree: btree}) do
       {:normal, root, %{btree: {_, leaf_links_loc, metadata_loc}}} ->
         {:ok, root_loc} = Log.put_node(log, root)
+        :ok = Log.flush(log)
         {:ok, {root_loc, leaf_links_loc, metadata_loc}}
 
       {:split, {lchild, split_k, rchild}, %{btree: {_, leaf_links_loc, metadata_loc}}} ->
@@ -106,6 +108,7 @@ defmodule Monsoon.BTree do
         }
 
         {:ok, root_loc} = Log.put_node(log, root)
+        :ok = Log.flush(log)
         {:ok, {root_loc, leaf_links_loc, metadata_loc}}
     end
   end
@@ -120,14 +123,17 @@ defmodule Monsoon.BTree do
 
       {:normal, root, %{btree: {_, leafs_link_loc, metadata_loc}}} ->
         {:ok, root_loc} = Log.put_node(log, root)
+        :ok = Log.flush(log)
         {:ok, {root_loc, leafs_link_loc, metadata_loc}}
 
       {:underflow, %Interior{keys: [], children: [root_loc]},
        %{btree: {_, leafs_link_loc, metadata_loc}}} ->
+        :ok = Log.flush(log)
         {:ok, {root_loc, leafs_link_loc, metadata_loc}}
 
       {:underflow, root, %{btree: {_, leafs_link_loc, metadata_loc}}} ->
         {:ok, root_loc} = Log.put_node(log, root)
+        :ok = Log.flush(log)
         {:ok, {root_loc, leafs_link_loc, metadata_loc}}
     end
   end

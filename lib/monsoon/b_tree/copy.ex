@@ -8,6 +8,7 @@ defmodule Monsoon.BTree.Copy do
     {:ok, root_loc} = copy_tree(from, to, root_loc)
     {:ok, leaf_links_loc} = copy_leaf_links(from, to, leaf_links_loc)
     btree = {root_loc, leaf_links_loc, metadata_loc}
+    :ok = Log.flush(to)
     :ok = Log.commit(to, btree)
     {:ok, btree}
   end

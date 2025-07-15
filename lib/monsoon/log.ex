@@ -80,7 +80,13 @@ defmodule Monsoon.Log do
   defp init(file_path) do
     with {:ok, file} <- :file.open(file_path, [:binary, :read, :raw, :append]),
          {:ok, position} <- :file.position(file, :eof) do
-      %{file: file, position: position, id_cache: %{}}
+      %{
+        file: file,
+        position: position,
+        id_cache: %{},
+        write_queue: :queue.new(),
+        pre_flush_position: 0
+      }
     end
   end
 
@@ -121,26 +127,23 @@ defmodule Monsoon.Log do
   @spec put_node(log :: t(), node :: BTree.t()) :: {:ok, location :: non_neg_integer()}
   def put_node(log, %BTree.Leaf{} = node) do
     Agent.get_and_update(log.pid, fn state ->
-      {:ok, position} = write_node(state.file, state.position, node)
+      block = encode_node_block(node)
+      write_queue = :queue.in({state.position, block}, state.write_queue)
+      position = state.position + byte_size(block)
       id_cache = Map.put(state.id_cache, Map.get(node, :id), state.position)
-      {{:ok, state.position}, %{state | position: position, id_cache: id_cache}}
+
+      {{:ok, state.position},
+       %{state | position: position, id_cache: id_cache, write_queue: write_queue}}
     end)
   end
 
   def put_node(log, %BTree.Interior{} = node) do
     Agent.get_and_update(log.pid, fn state ->
-      {:ok, position} = write_node(state.file, state.position, node)
-      {{:ok, state.position}, %{state | position: position}}
+      block = encode_node_block(node)
+      write_queue = :queue.in({state.position, block}, state.write_queue)
+      position = state.position + byte_size(block)
+      {{:ok, state.position}, %{state | position: position, write_queue: write_queue}}
     end)
-  end
-
-  defp write_node(file, loc, node) do
-    block = encode_node_block(node)
-
-    with :ok <- :file.pwrite(file, loc, block) do
-      loc = loc + byte_size(block)
-      {:ok, loc}
-    end
   end
 
   def get_node_by_id(log, id) do
@@ -212,7 +215,7 @@ defmodule Monsoon.Log do
       {:ok, position} =
         write_commit(state.file, state.position, {root_loc, leaf_links_loc, metadata_loc})
 
-      %{state | position: position}
+      %{state | position: position, pre_flush_position: position}
     end)
   end
 
@@ -233,19 +236,13 @@ defmodule Monsoon.Log do
   end
 
   @spec put_leaf_links(log :: t(), dll :: map()) :: :ok
-  def put_leaf_links(log, leaf_ptrs) do
+  def put_leaf_links(log, leaf_links) do
     Agent.get_and_update(log.pid, fn state ->
-      {:ok, position} = write_leaf_ptrs(state.file, state.position, leaf_ptrs)
-      {{:ok, state.position}, %{state | position: position}}
+      block = encode_leaf_links_block(leaf_links)
+      write_queue = :queue.in({state.position, block}, state.write_queue)
+      position = state.position + byte_size(block)
+      {{:ok, state.position}, %{state | position: position, write_queue: write_queue}}
     end)
-  end
-
-  defp write_leaf_ptrs(file, position, leaf_ptrs) do
-    block = encode_leaf_links_block(leaf_ptrs)
-
-    with :ok <- :file.pwrite(file, position, block) do
-      {:ok, position + byte_size(block)}
-    end
   end
 
   @spec get_leaf_links(log :: t(), leaf_links_loc :: non_neg_integer()) :: {:ok, map()}
@@ -265,6 +262,35 @@ defmodule Monsoon.Log do
         @leaf_links_block_size
 
     :file.pread(file, loc, block_size)
+  end
+
+  def flush(log) do
+    Agent.update(log.pid, fn state ->
+      {:ok, position, write_queue} =
+        flush_queue(state.file, state.pre_flush_position, state.write_queue)
+
+      %{state | position: position, write_queue: write_queue, pre_flush_position: position}
+    end)
+  end
+
+  defp flush_queue(file, position, queue) do
+    with {:ok, new_position, queue, all_blocks} <- collect_blocks(position, queue, <<>>),
+         :ok <- :file.pwrite(file, position, all_blocks) do
+      {:ok, new_position, queue}
+    end
+  end
+
+  defp collect_blocks(position, queue, acc) do
+    case :queue.out(queue) do
+      {:empty, queue} ->
+        {:ok, position, queue, acc}
+
+      {{:value, {^position, block}}, queue} ->
+        collect_blocks(position + byte_size(block), queue, acc <> block)
+
+      _ ->
+        {:error, :wrong_position}
+    end
   end
 
   defp encode_node_block(node) do
