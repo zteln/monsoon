@@ -4,10 +4,10 @@ defmodule Monsoon.BTree.Copy do
 
   # @spec copy(from :: Log.t(), to :: Log.t(), root :: Monsoon.BTree.t()) :: :ok
   def copy(btree, from, to) do
-    {root_loc, leaf_links_loc, metadata_loc} = btree
-    {:ok, root_loc} = copy_tree(from, to, root_loc)
-    {:ok, leaf_links_loc} = copy_leaf_links(from, to, leaf_links_loc)
-    btree = {root_loc, leaf_links_loc, metadata_loc}
+    {root_bp, leaf_links_loc, metadata_loc} = btree
+    root_bp = copy_tree(from, to, root_bp)
+    leaf_links_bp = copy_leaf_links(from, to, leaf_links_loc)
+    btree = {root_bp, leaf_links_bp, metadata_loc}
     :ok = Log.flush(to)
     :ok = Log.commit(to, btree)
     {:ok, btree}
@@ -30,10 +30,9 @@ defmodule Monsoon.BTree.Copy do
   defp update_children(from, to, %Interior{} = node) do
     new_children =
       node.children
-      |> Enum.map(fn child_loc ->
-        {:ok, child} = Log.get_node(from, child_loc)
-        {:ok, new_child_loc} = update_children(from, to, child)
-        new_child_loc
+      |> Enum.map(fn child_bp ->
+        {:ok, child} = Log.get_node(from, child_bp)
+        update_children(from, to, child)
       end)
 
     node = %{node | children: new_children}

@@ -199,5 +199,39 @@ defmodule MonsoonTest do
       assert :ok = Monsoon.cancel_transaction(c.db)
       assert nil == Monsoon.get(c.db, 1)
     end
+
+    test "multiple transactions follow last write wins", c do
+      parent = self()
+      ref1 = make_ref()
+      ref2 = make_ref()
+
+      spawn(fn ->
+        assert :ok == Monsoon.start_transaction(c.db)
+        :timer.sleep(Enum.random(1..200))
+        assert :ok == Monsoon.put(c.db, 1, "A-1")
+        assert :ok == Monsoon.end_transaction(c.db)
+        send(parent, {:done, ref1})
+      end)
+
+      spawn(fn ->
+        assert :ok == Monsoon.start_transaction(c.db)
+        :timer.sleep(Enum.random(1..200))
+        assert :ok == Monsoon.put(c.db, 1, "B-1")
+        assert :ok == Monsoon.end_transaction(c.db)
+        send(parent, {:done, ref2})
+      end)
+
+      receive do
+        {:done, ^ref1} ->
+          :ok
+      end
+
+      receive do
+        {:done, ^ref2} ->
+          :ok
+      end
+
+      assert Monsoon.get(c.db, 1) in ["A-1", "B-1"]
+    end
   end
 end

@@ -32,22 +32,22 @@ defmodule Monsoon.BTree.Remove do
         nil
 
       {:normal, child, extra} ->
-        {:ok, child_loc} = Log.put_node(extra.log, child)
-        children = List.replace_at(node.children, idx, child_loc)
+        child_bp = Log.put_node(extra.log, child)
+        children = List.replace_at(node.children, idx, child_bp)
         node = %{node | children: children}
         {:normal, node, extra}
 
       {:underflow, child, extra} ->
         if idx < length(node.keys) do
           # has right sibling
-          rchild_loc = Enum.at(node.children, idx + 1)
-          {:ok, rchild} = Log.get_node(extra.log, rchild_loc)
+          rchild_bp = Enum.at(node.children, idx + 1)
+          {:ok, rchild} = Log.get_node(extra.log, rchild_bp)
           handle_underflow(idx, child, node, rchild, true, extra)
         else
           # child is last, take left sibling
           idx = idx - 1
-          lchild_loc = Enum.at(node.children, idx)
-          {:ok, lchild} = Log.get_node(extra.log, lchild_loc)
+          lchild_bp = Enum.at(node.children, idx)
+          {:ok, lchild} = Log.get_node(extra.log, lchild_bp)
           handle_underflow(idx, lchild, node, child, false, extra)
         end
     end
@@ -60,13 +60,13 @@ defmodule Monsoon.BTree.Remove do
       # sibling is not minimal, rotate keys
       {lchild, parent, rchild} = rotate_leafs(idx, lchild, parent, rchild, from_left?)
 
-      {:ok, lchild_loc} = Log.put_node(extra.log, lchild)
-      {:ok, rchild_loc} = Log.put_node(extra.log, rchild)
+      lchild_bp = Log.put_node(extra.log, lchild)
+      rchild_bp = Log.put_node(extra.log, rchild)
 
       children =
         parent.children
-        |> List.replace_at(idx, lchild_loc)
-        |> List.replace_at(idx + 1, rchild_loc)
+        |> List.replace_at(idx, lchild_bp)
+        |> List.replace_at(idx + 1, rchild_bp)
 
       parent = %{parent | children: children}
       {:normal, parent, extra}
@@ -74,12 +74,12 @@ defmodule Monsoon.BTree.Remove do
       # sibling is minimal, merge keys
       {mchild, parent} = merge_leafs(idx, lchild, parent, rchild)
       extra = merge_leaf_links(lchild, mchild, rchild, extra)
-      {:ok, mchild_loc} = Log.put_node(extra.log, mchild)
+      mchild_bp = Log.put_node(extra.log, mchild)
 
       children =
         parent.children
         |> List.delete_at(idx + 1)
-        |> List.replace_at(idx, mchild_loc)
+        |> List.replace_at(idx, mchild_bp)
 
       parent = %{parent | children: children}
 
@@ -101,13 +101,13 @@ defmodule Monsoon.BTree.Remove do
       # rotate interior nodes
       {lchild, parent, rchild} = rotate_interior(idx, lchild, parent, rchild, from_left?)
 
-      {:ok, lchild_loc} = Log.put_node(extra.log, lchild)
-      {:ok, rchild_loc} = Log.put_node(extra.log, rchild)
+      lchild_bp = Log.put_node(extra.log, lchild)
+      rchild_bp = Log.put_node(extra.log, rchild)
 
       children =
         parent.children
-        |> List.replace_at(idx, lchild_loc)
-        |> List.replace_at(idx + 1, rchild_loc)
+        |> List.replace_at(idx, lchild_bp)
+        |> List.replace_at(idx + 1, rchild_bp)
 
       parent = %{parent | children: children}
       {:normal, parent, extra}
@@ -115,12 +115,12 @@ defmodule Monsoon.BTree.Remove do
       # merge interior nodes
       {mchild, parent} = merge_interior(idx, lchild, parent, rchild)
 
-      {:ok, mchild_loc} = Log.put_node(extra.log, mchild)
+      mchild_bp = Log.put_node(extra.log, mchild)
 
       children =
         parent.children
         |> List.delete_at(idx + 1)
-        |> List.replace_at(idx, mchild_loc)
+        |> List.replace_at(idx, mchild_bp)
 
       parent = %{parent | children: children}
 
@@ -249,9 +249,9 @@ defmodule Monsoon.BTree.Remove do
       |> Map.delete(rchild.id)
       |> Map.put(mchild.id, {prev, next})
 
-    {:ok, leaf_links_loc} = Log.put_leaf_links(extra.log, leaf_links)
+    leaf_links_bp = Log.put_leaf_links(extra.log, leaf_links)
 
-    %{extra | btree: {root_loc, leaf_links_loc, metadata_loc}}
+    %{extra | btree: {root_loc, leaf_links_bp, metadata_loc}}
   end
 
   defp has_underflow(node), do: length(node.keys) < div(node.capacity, 2)

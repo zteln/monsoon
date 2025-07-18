@@ -18,6 +18,7 @@ defmodule BenchmarkHelpers do
   def generate_data(count) do
     1..count
     |> Enum.map(fn n -> {"key_#{n}", "value_#{String.duplicate("x", 100)}_#{n}"} end)
+    |> Enum.shuffle()
   end
 
   def populate_db(db, data) do
@@ -50,27 +51,26 @@ Benchee.run(
     "large (10K items)" => {"large", large_dataset},
     "huge (100K items)" => {"huge", huge_dataset}
   },
-  before_each: fn {size, data} ->
-    # Ensure no previous data
+  before_scenario: fn {size, data} ->
     File.mkdir_p!("#{db_dir}/#{size}")
-
-    # Start db
     db = BenchmarkHelpers.setup_db("#{db_dir}/#{size}")
-
-    # Pre-populate db
-    BenchmarkHelpers.populate_db(db, Enum.take(data, length(data) - 1))
-
-    {db, Enum.at(data, -1)}
+    BenchmarkHelpers.populate_db(db, data)
+    {db, data}
   end,
-  after_each: fn db ->
+  before_each: fn {db, data} ->
+    {k, v} = Enum.random(data)
+    Monsoon.remove(db, k)
+    {db, {k, v}}
+  end,
+  after_scenario: fn {db, _} ->
     %{log: log} = :sys.get_state(db)
     Agent.stop(log.pid)
     GenServer.stop(db)
     File.rm_rf(db_dir)
   end,
   memory_time: 2,
-  time: 5,
-  profile_after: true
+  time: 5
+  # profile_after: :tprof
   # save: %{path: "benchmarks/#{benchmark_tag}.benchee", tag: benchmark_tag},
   # load: ["benchmarks/*"],
   # formatters: [

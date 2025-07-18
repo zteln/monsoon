@@ -1,28 +1,81 @@
 defmodule Monsoon.Log do
   @moduledoc """
-  commit_block:
-  | (type::16-bit | root_loc::32-bit | leaf_links_loc::32-bit | metadata_loc::32-bit) |
+  Handles writing and reading to and from the log file.
+  There are four different blocks that are written to the log: a commit block, a node block, a leaf links block, a metadata block.
+  Each block has a unit size of 1024 bytes.
 
-  node_block:
-  | (type::16-bit | id::64-bit | node-size::32-bit) | node |
+  ## Block specifications:
 
-  leaf_links_block:
-  | (type::16-bit | size::32-bit) | leaf_links |
+  Commit block:
+  Contains information about the latest commit. The latest commit is the first commit block when reading backwards for end-of-file position.
+      
+      <<
+        0xFAFA::integer-16, 
+        root_loc::integer-32,
+        root_size::integer-32,
+        leaf_links_loc::integer-32,
+        leaf_links_size::integer-32,
+        metadata_loc::integer-32,
+        metadata_size::integer-32,
+        _::binary
+      >>
 
-  metadata_block:
-  | (type::16-bit | size::32-bit) | metadata |
+  Node block:
+  Contains a node, either leaf or interior. Specifies `id` and `size`.
+
+      <<
+        0xFBFB::integer-16,
+        id::integer-64,
+        size::integer-32,
+        node::binary
+      >>
+
+  Leaf links block:
+  Contains the leaf links (sibling links between leafs). Specifies the size of the leaf links.
+
+      <<
+        0xFCFC::integer-16,
+        size::integer-32,
+        leaf_links::binary
+      >>
+
+  Metadata block:
+  Contains the metadata data. Specifies the size of the encoded metadata.
+
+      <<
+        0xFDFD::integer-16,
+        size::integer-32,
+        metadata::binary
+      >>
   """
 
   alias Monsoon.BTree
 
-  @commit_block_size 32
-  @node_block_size 1024
-  @leaf_links_block_size 512
-  @metadata_block_size 512
+  @block_size 1024
 
-  @commit_header_size byte_size(<<0::integer-16, 0::integer-32, 0::integer-32, 0::integer-32>>)
-  @node_header_size byte_size(<<0::integer-16, 0::unsigned-integer-64, 0::integer-32>>)
-  @leaf_links_header_size byte_size(<<0::integer-16, 0::integer-32>>)
+  @commit_header_size byte_size(<<
+                        0::integer-16,
+                        0::integer-32,
+                        0::integer-32,
+                        0::integer-32,
+                        0::integer-32,
+                        0::integer-32,
+                        0::integer-32
+                      >>)
+  @node_header_size byte_size(<<
+                      0::integer-16,
+                      0::unsigned-integer-64,
+                      0::integer-32
+                    >>)
+
+  @leaf_links_header_size byte_size(<<
+                            0::integer-16,
+                            0::integer-32
+                          >>)
+  @metadata_header_size byte_size(<<
+                          0::integer-16,
+                          0::integer-32
+                        >>)
 
   @commit_key 0xFAFA
   @node_key 0xFBFB
@@ -34,12 +87,25 @@ defmodule Monsoon.Log do
     :file_path
   ]
 
+  @type block_pointer :: {location :: non_neg_integer(), size :: non_neg_integer()}
+
   @type t :: %__MODULE__{
           pid: pid(),
           file_path: String.t()
         }
 
-  @spec new(dir :: String.t()) :: Agent.on_start()
+  @type state :: %{
+          file: :file.io_device(),
+          position: non_neg_integer(),
+          id_cache: map(),
+          write_queue: :queue.queue(),
+          pre_flush_position: non_neg_integer()
+        }
+
+  @doc """
+  Creates a new log resource. Sets a global lock on the provided file path.
+  """
+  @spec new(file_path :: String.t()) :: Agent.on_start()
   def new(file_path) do
     with {:ok, pid} <-
            Agent.start_link(fn ->
@@ -54,6 +120,24 @@ defmodule Monsoon.Log do
     end
   end
 
+  defp init(file_path) do
+    with {:ok, file} <- :file.open(file_path, [:binary, :read, :raw, :append]),
+         {:ok, position} <- :file.position(file, :eof) do
+      %{
+        file: file,
+        position: position,
+        id_cache: %{},
+        write_queue: :queue.new(),
+        pre_flush_position: 0
+      }
+    end
+  end
+
+  @doc """
+  Renames froms path to tos path.
+  Stops the from agent resource and updates lock in to to renamed file path.
+  """
+  @spec move(from :: t(), to :: t()) :: t()
   def move(from, to) do
     :ok = :file.rename(to.file_path, from.file_path)
     :ok = Agent.stop(from.pid)
@@ -77,193 +161,179 @@ defmodule Monsoon.Log do
     true = :global.del_lock({file_path, self()}, [node()])
   end
 
-  defp init(file_path) do
-    with {:ok, file} <- :file.open(file_path, [:binary, :read, :raw, :append]),
-         {:ok, position} <- :file.position(file, :eof) do
-      %{
-        file: file,
-        position: position,
-        id_cache: %{},
-        write_queue: :queue.new(),
-        pre_flush_position: 0
-      }
-    end
-  end
-
+  @doc """
+  Searches for the latest written commit block. Returns decoded locations.
+  """
   @spec get_commit(log :: t()) :: {:ok, nil | non_neg_integer()} | {:error, term()}
   def get_commit(log) do
     Agent.get(log.pid, fn state ->
-      read_latest_commit_block(state.file, state.position)
+      with {:ok, header, _loc} <-
+             find_block_header(
+               state.file,
+               state.position,
+               @block_size,
+               @commit_header_size,
+               <<@commit_key::integer-16>>
+             ) do
+        decode_commit_block(header)
+      end
     end)
   end
 
-  defp read_latest_commit_block(file, position) do
-    position = max(position - @commit_block_size, 0)
+  @doc """
+  Writes a commit block to the log. 
+  Raises if it fails to write.
+  When written, the file is synced.
+  """
+  @spec commit(
+          log :: t(),
+          {root_loc :: non_neg_integer(), leaf_links_loc :: non_neg_integer(),
+           metadata_loc :: non_neg_integer()}
+        ) :: :ok
+  def commit(log, {root_bp, leaf_links_bp, metadata_bp}) do
+    Agent.update(log.pid, fn state ->
+      block = encode_commit_block(root_bp, leaf_links_bp, metadata_bp)
 
-    case :file.pread(file, position, @commit_header_size) do
-      :eof ->
-        {:ok, nil}
+      {_position, write_queue} = enqueue(state.write_queue, block, state.position)
 
-      {:ok,
-       <<
-         @commit_key::integer-16,
-         root_loc::integer-32,
-         leaf_links_loc::integer-32,
-         metadata_loc::integer-32
-       >>} ->
-        {:ok, {root_loc, leaf_links_loc, metadata_loc}}
+      {:ok, position, write_queue} =
+        flush_queue(state.file, state.pre_flush_position, write_queue)
 
-      {:ok, _} when position == 0 ->
-        {:ok, nil}
+      :ok = :file.datasync(state.file)
 
-      {:ok, _} ->
-        read_latest_commit_block(file, position)
-
-      {:error, _reason} = error ->
-        error
-    end
+      %{state | position: position, pre_flush_position: position, write_queue: write_queue}
+    end)
   end
 
-  @spec put_node(log :: t(), node :: BTree.t()) :: {:ok, location :: non_neg_integer()}
+  @doc """
+  Encodes and writes a node block to the log. Returns the position of where in the log the node was written. Raises if it fails.
+  """
+  @spec put_node(log :: t(), node :: BTree.t()) :: BTree.child()
   def put_node(log, %BTree.Leaf{} = node) do
     Agent.get_and_update(log.pid, fn state ->
       block = encode_node_block(node)
-      write_queue = :queue.in({state.position, block}, state.write_queue)
-      position = state.position + byte_size(block)
-      id_cache = Map.put(state.id_cache, Map.get(node, :id), state.position)
+      loc_and_size = {state.position, byte_size(block)}
+      {position, write_queue} = enqueue(state.write_queue, block, state.position)
+      id_cache = Map.put(state.id_cache, Map.get(node, :id), loc_and_size)
 
-      {{:ok, state.position},
-       %{state | position: position, id_cache: id_cache, write_queue: write_queue}}
+      {loc_and_size, %{state | position: position, id_cache: id_cache, write_queue: write_queue}}
     end)
   end
 
   def put_node(log, %BTree.Interior{} = node) do
     Agent.get_and_update(log.pid, fn state ->
       block = encode_node_block(node)
-      write_queue = :queue.in({state.position, block}, state.write_queue)
-      position = state.position + byte_size(block)
-      {{:ok, state.position}, %{state | position: position, write_queue: write_queue}}
+      {position, write_queue} = enqueue(state.write_queue, block, state.position)
+
+      {{state.position, byte_size(block)},
+       %{state | position: position, write_queue: write_queue}}
     end)
   end
 
+  @doc """
+  Attempts to read the node with corresponding ID. 
+  Returns `{:ok, node}` on a successful read, `{:error, reason}` otherwise.
+  """
+  @spec get_node_by_id(log :: t(), id :: binary()) :: {:ok, BTree.t()} | {:error, term()}
   def get_node_by_id(log, id) do
     Agent.get(log.pid, fn state ->
-      block =
-        case Map.get(state.id_cache, id) do
-          nil ->
-            # traverse
-            {:ok, block} = read_node_from_id(state.file, state.position, id)
-            block
+      case Map.get(state.id_cache, id) do
+        nil ->
+          # traverse
+          with {:ok, <<@node_key::integer-16, ^id::binary-size(8), size::integer-32>>} <-
+                 find_block_header(
+                   state.file,
+                   state.position,
+                   @block_size,
+                   @node_header_size,
+                   <<@node_key::integer-16, id::binary-size(8)>>
+                 ),
+               {:ok, block} <-
+                 :file.pread(
+                   state.file,
+                   state.position,
+                   no_of_blocks(@node_header_size + size, @block_size) * @block_size
+                 ) do
+            decode_node_block(block)
+          end
 
-          loc ->
-            {:ok, block} = read_node_from_loc(state.file, loc)
-            block
-        end
-
-      {:ok, decode_node_block(block)}
+        {loc, size} ->
+          with {:ok, block} <- :file.pread(state.file, loc, size) do
+            decode_node_block(block)
+          end
+      end
     end)
   end
 
-  defp read_node_from_id(file, position, id) do
-    position = max(position - @node_block_size, 0)
-
-    case :file.pread(file, position, @node_header_size) do
-      :eof ->
-        {:ok, nil}
-
-      {:ok, <<@node_key::integer-16, ^id::binary-size(8), size::integer-32>>} ->
-        block_size =
-          no_of_blocks(@node_header_size + size, @node_block_size) * @node_block_size
-
-        :file.pread(
-          file,
-          position,
-          block_size
-        )
-
-      {:ok, _} when position == 0 ->
-        {:ok, nil}
-
-      {:ok, _} ->
-        read_node_from_id(file, position, id)
-
-      {:error, _reason} = e ->
-        e
-    end
-  end
-
-  @spec get_node(log :: t(), loc :: non_neg_integer()) :: {:ok, BTree.t()}
-  def get_node(log, loc) do
+  @doc """
+  Gets node from file based on location and size. Returns `{:ok, decoded_node}` or `{:error, reason}`.
+  """
+  @spec get_node(log :: t(), BTree.child()) :: {:ok, BTree.t()} | {:error, term()}
+  def get_node(log, {loc, size}) do
     Agent.get(log.pid, fn state ->
-      {:ok, block} = read_node_from_loc(state.file, loc)
-      {:ok, decode_node_block(block)}
+      with {:ok, block} <- :file.pread(state.file, loc, size) do
+        decode_node_block(block)
+      end
     end)
   end
 
-  defp read_node_from_loc(file, loc) do
-    {:ok, <<@node_key::integer-16, _id::binary-size(8), size::integer-32>>} =
-      :file.pread(file, loc, @node_header_size)
-
-    block_size = no_of_blocks(@node_header_size + size, @node_block_size) * @node_block_size
-
-    :file.pread(file, loc, block_size)
-  end
-
-  @spec commit(log :: t(), root_loc :: non_neg_integer()) :: :ok
-  def commit(log, {root_loc, leaf_links_loc, metadata_loc}) do
-    Agent.update(log.pid, fn state ->
-      {:ok, position} =
-        write_commit(state.file, state.position, {root_loc, leaf_links_loc, metadata_loc})
-
-      %{state | position: position, pre_flush_position: position}
-    end)
-  end
-
-  defp write_commit(file, position, {root_loc, leaf_links_loc, metadata_loc}) do
-    block =
-      <<
-        @commit_key::integer-16,
-        root_loc::integer-32,
-        leaf_links_loc::integer-32,
-        metadata_loc::integer-32,
-        0::size(@commit_block_size - @commit_header_size)-unit(8)
-      >>
-
-    with :ok <- :file.pwrite(file, position, block),
-         :ok <- :file.datasync(file) do
-      {:ok, position + @commit_block_size}
-    end
-  end
-
-  @spec put_leaf_links(log :: t(), dll :: map()) :: :ok
+  @doc """
+  Writes the leaf links to file. Returns a block pointer.
+  """
+  @spec put_leaf_links(log :: t(), leaf_links :: map()) :: block_pointer()
   def put_leaf_links(log, leaf_links) do
     Agent.get_and_update(log.pid, fn state ->
       block = encode_leaf_links_block(leaf_links)
-      write_queue = :queue.in({state.position, block}, state.write_queue)
-      position = state.position + byte_size(block)
-      {{:ok, state.position}, %{state | position: position, write_queue: write_queue}}
+      {position, write_queue} = enqueue(state.write_queue, block, state.position)
+
+      {{state.position, byte_size(block)},
+       %{state | position: position, write_queue: write_queue}}
     end)
   end
 
-  @spec get_leaf_links(log :: t(), leaf_links_loc :: non_neg_integer()) :: {:ok, map()}
-  def get_leaf_links(log, leaf_links_loc) do
+  @doc """
+  Reads the leaf links from file according to provided block pointer. Returns `{:ok, leaf_links}` or `{:error, reason}`.
+  """
+  @spec get_leaf_links(log :: t(), leaf_links_bp :: block_pointer()) ::
+          {:ok, map()} | {:error, term()}
+  def get_leaf_links(log, {loc, size}) do
     Agent.get(log.pid, fn state ->
-      {:ok, block} = read_leaf_links_block(state.file, leaf_links_loc)
-      {:ok, decode_leaf_links_block(block)}
+      with {:ok, block} <- :file.pread(state.file, loc, size) do
+        decode_leaf_links_block(block)
+      end
     end)
   end
 
-  defp read_leaf_links_block(file, loc) do
-    {:ok, <<@leaf_links_key::integer-16, size::integer-32>>} =
-      :file.pread(file, loc, @leaf_links_header_size)
+  @doc """
+  Enqueues metadata, returning the corresponding block pointer to metadata.
+  """
+  @spec put_metadata(log :: t(), metadata :: keyword()) :: block_pointer()
+  def put_metadata(log, metadata) do
+    Agent.get_and_update(log.pid, fn state ->
+      block = encode_metadata_block(metadata)
+      {position, write_queue} = enqueue(state.write_queue, block, state.position)
 
-    block_size =
-      no_of_blocks(@leaf_links_header_size + size, @leaf_links_block_size) *
-        @leaf_links_block_size
-
-    :file.pread(file, loc, block_size)
+      {{state.position, byte_size(block)},
+       %{state | position: position, write_queue: write_queue}}
+    end)
   end
 
+  @doc """
+  Reads the metadata from file according to provided block pointer. Returns `{:ok, metadata}` if successful, `{:error, reason}` otherwise.
+  """
+  @spec get_metadata(log :: t(), metadata_bp :: block_pointer()) ::
+          {:ok, keyword()} | {:error, term()}
+  def get_metadata(log, {loc, size}) do
+    Agent.get(log.pid, fn state ->
+      with {:ok, block} <- :file.pread(state.file, loc, size) do
+        decode_metadata_block(block)
+      end
+    end)
+  end
+
+  @doc """
+  Flushes the write queue to file by joining all blocks in the queue and writes once to file.
+  """
   def flush(log) do
     Agent.update(log.pid, fn state ->
       {:ok, position, write_queue} =
@@ -293,35 +363,127 @@ defmodule Monsoon.Log do
     end
   end
 
+  defp enqueue(queue, block, position) do
+    queue = :queue.in({position, block}, queue)
+    {position + byte_size(block), queue}
+  end
+
+  defp encode_commit_block(
+         {root_loc, root_size},
+         {leaf_links_loc, leaf_links_size},
+         {metadata_loc, metadata_size}
+       ) do
+    <<
+      @commit_key::integer-16,
+      root_loc::integer-32,
+      root_size::integer-32,
+      leaf_links_loc::integer-32,
+      leaf_links_size::integer-32,
+      metadata_loc::integer-32,
+      metadata_size::integer-32,
+      0::size(@block_size - @commit_header_size)-unit(8)
+    >>
+  end
+
+  defp decode_commit_block(block) do
+    case block do
+      <<
+        @commit_key::integer-16,
+        root_loc::integer-32,
+        root_size::integer-32,
+        leaf_links_loc::integer-32,
+        leaf_links_size::integer-32,
+        metadata_loc::integer-32,
+        metadata_size::integer-32
+      >> ->
+        {:ok,
+         {{root_loc, root_size}, {leaf_links_loc, leaf_links_size}, {metadata_loc, metadata_size}}}
+
+      _ ->
+        {:error, :unable_to_decode_commit}
+    end
+  end
+
   defp encode_node_block(node) do
-    id = if Map.has_key?(node, :id), do: Map.get(node, :id), else: <<0::unsigned-integer-64>>
+    id = Map.get(node, :id, <<0::unsigned-integer-64>>)
     enc = :erlang.term_to_binary(node)
     node_size = byte_size(enc)
     block_size = byte_size(<<0::integer-16, 0::integer-64, 0::integer-32, enc::binary>>)
-    no_of_blocks = no_of_blocks(block_size, @node_block_size)
+    no_of_blocks = no_of_blocks(block_size, @block_size)
     content = <<@node_key::integer-16, id::binary, node_size::integer-32, enc::binary>>
-    padding_size = no_of_blocks * @node_block_size - block_size
+    padding_size = no_of_blocks * @block_size - block_size
     <<content::binary, 0::size(padding_size)-unit(8)>>
   end
 
   defp decode_node_block(block) do
-    <<@node_key::integer-16, _id::binary-size(8), _size::integer-32, bin::binary>> = block
-    :erlang.binary_to_term(bin)
+    case block do
+      <<@node_key::integer-16, _id::binary-size(8), _size::integer-32, bin::binary>> ->
+        {:ok, :erlang.binary_to_term(bin)}
+
+      _ ->
+        {:error, :unable_to_decode_node}
+    end
   end
 
-  defp encode_leaf_links_block(ptrs) do
-    enc = :erlang.term_to_binary(ptrs)
-    ptrs_size = byte_size(enc)
-    ptrs_block_size = byte_size(<<0::integer-16, 0::integer-32, enc::binary>>)
-    no_of_blocks = no_of_blocks(ptrs_block_size, @leaf_links_block_size)
-    content = <<@leaf_links_key::integer-16, ptrs_size::integer-32, enc::binary>>
-    padding_size = no_of_blocks * @leaf_links_block_size - ptrs_block_size
+  defp encode_leaf_links_block(leaf_links) do
+    enc = :erlang.term_to_binary(leaf_links)
+    leaf_links_size = byte_size(enc)
+    block_size = @leaf_links_header_size + leaf_links_size
+    no_of_blocks = no_of_blocks(block_size, @block_size)
+    content = <<@leaf_links_key::integer-16, leaf_links_size::integer-32, enc::binary>>
+    padding_size = no_of_blocks * @block_size - block_size
     <<content::binary, 0::size(padding_size)-unit(8)>>
   end
 
   defp decode_leaf_links_block(block) do
-    <<@leaf_links_key::integer-16, _size::integer-32, enc::binary>> = block
-    :erlang.binary_to_term(enc)
+    case block do
+      <<@leaf_links_key::integer-16, _size::integer-32, enc::binary>> ->
+        {:ok, :erlang.binary_to_term(enc)}
+
+      _ ->
+        {:error, :unable_to_decode_leaf_links}
+    end
+  end
+
+  defp encode_metadata_block(metadata) do
+    enc = :erlang.term_to_binary(metadata)
+    metadata_size = byte_size(enc)
+    block_size = @metadata_header_size + metadata_size
+    no_of_blocks = no_of_blocks(block_size, @block_size)
+    content = <<@metadata_key::integer-16, metadata_size::integer-32, enc::binary>>
+    padding_size = no_of_blocks * block_size - block_size
+    <<content::binary, 0::size(padding_size)-unit(8)>>
+  end
+
+  defp decode_metadata_block(block) do
+    case block do
+      <<@metadata_key::integer-16, _size::integer-32, enc::binary>> ->
+        {:ok, :erlang.binary_to_term(enc)}
+
+      _ ->
+        {:error, :unable_to_decode_leaf_links}
+    end
+  end
+
+  defp find_block_header(file, position, block_size, header_size, match) do
+    position = max(position - block_size, 0)
+
+    case :file.pread(file, position, header_size) do
+      {:ok, ^match <> <<_rest::binary>> = header} ->
+        {:ok, header, position}
+
+      {:ok, _} when position == 0 ->
+        {:error, :not_found}
+
+      {:ok, _} ->
+        find_block_header(file, position, block_size, header_size, match)
+
+      :eof ->
+        {:error, :eof}
+
+      {:error, _reason} = e ->
+        e
+    end
   end
 
   defp no_of_blocks(size, unit) do

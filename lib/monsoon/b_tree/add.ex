@@ -40,28 +40,28 @@ defmodule Monsoon.BTree.Add do
 
     case add(child, key, value, extra) do
       {:normal, child, extra} ->
-        {:ok, child_loc} = Log.put_node(extra.log, child)
-        children = List.replace_at(node.children, cidx, child_loc)
+        child_bp = Log.put_node(extra.log, child)
+        children = List.replace_at(node.children, cidx, child_bp)
         node = %{node | children: children}
         {:normal, node, extra}
 
       {:split, {lnode, split_key, rnode}, extra} ->
         if is_full(node) do
           # full interior node, split node
-          {:ok, lnode_loc} = Log.put_node(extra.log, lnode)
-          {:ok, rnode_loc} = Log.put_node(extra.log, rnode)
-          handle_interior_split(node, cidx, split_key, lnode_loc, rnode_loc, extra)
+          lnode_bp = Log.put_node(extra.log, lnode)
+          rnode_bp = Log.put_node(extra.log, rnode)
+          handle_interior_split(node, cidx, split_key, lnode_bp, rnode_bp, extra)
         else
           # not full, insert key
           keys = List.insert_at(node.keys, idx, split_key)
 
-          {:ok, lnode_loc} = Log.put_node(extra.log, lnode)
-          {:ok, rnode_loc} = Log.put_node(extra.log, rnode)
+          lnode_bp = Log.put_node(extra.log, lnode)
+          rnode_bp = Log.put_node(extra.log, rnode)
 
           children =
             node.children
-            |> List.replace_at(idx, lnode_loc)
-            |> List.insert_at(idx + 1, rnode_loc)
+            |> List.replace_at(idx, lnode_bp)
+            |> List.insert_at(idx + 1, rnode_bp)
 
           node = %{node | keys: keys, children: children}
           {:normal, node, extra}
@@ -171,9 +171,9 @@ defmodule Monsoon.BTree.Add do
       |> Map.put(lnode.id, {prev, rnode.id})
       |> Map.put(rnode.id, {lnode.id, next})
 
-    {:ok, leaf_links_loc} = Log.put_leaf_links(extra.log, leaf_links)
+    leaf_links_bp = Log.put_leaf_links(extra.log, leaf_links)
 
-    %{extra | btree: {root_loc, leaf_links_loc, metadata_loc}}
+    %{extra | btree: {root_loc, leaf_links_bp, metadata_loc}}
   end
 
   defp is_full(node), do: length(node.keys) >= node.capacity - 1
