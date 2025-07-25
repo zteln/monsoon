@@ -31,8 +31,8 @@ defmodule Monsoon.LogTest do
 
   describe "commit/2" do
     test "writes commit to log", c do
-      assert :ok == Log.commit(c.log, {{1, 5}, {2, 6}, {3, 7}})
-      assert {:ok, {{1, 5}, {2, 6}, {3, 7}}} == Log.get_commit(c.log)
+      assert :ok == Log.commit(c.log, {1, 5}, {2, 6}, {3, 7})
+      assert {:ok, {1, 5}, {2, 6}, {3, 7}} == Log.get_commit(c.log)
     end
   end
 
@@ -82,14 +82,33 @@ defmodule Monsoon.LogTest do
     end
   end
 
-  describe "put_leaf_links/2" do
-    test "updates leaf links in file", c do
+  describe "put_leaf_links/2,get_leaf_links/2" do
+    test "can write and read leaf links in file", c do
       leaf_links = %{1 => {2, 3}}
 
       assert {_loc, _size} = leaf_links_bp = Log.put_leaf_links(c.log, leaf_links)
       :ok = Log.flush(c.log)
 
-      assert {:ok, %{1 => {2, 3}}} == Log.get_leaf_links(c.log, leaf_links_bp)
+      assert {:ok, leaf_links} == Log.get_leaf_links(c.log, leaf_links_bp)
+    end
+
+    test "cannot read with invalid block pointer", c do
+      leaf_links = %{1 => {2, 3}}
+
+      assert {_loc, _size} = Log.put_leaf_links(c.log, leaf_links)
+      :ok = Log.flush(c.log)
+      assert {:error, :unable_to_decode_leaf_links} == Log.get_leaf_links(c.log, {1, 102})
+    end
+  end
+
+  describe "put_metadata/2,get_metadata/2" do
+    test "can write and read metadata to and from file", c do
+      metadata = [a: 1, b: 2]
+
+      assert {_loc, _size} = metadata_bp = Log.put_metadata(c.log, metadata)
+      :ok = Log.flush(c.log)
+
+      assert {:ok, metadata} == Log.get_metadata(c.log, metadata_bp)
     end
   end
 end

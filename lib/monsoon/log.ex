@@ -102,9 +102,6 @@ defmodule Monsoon.Log do
           pre_flush_position: non_neg_integer()
         }
 
-  @doc """
-  Creates a new log resource. Sets a global lock on the provided file path.
-  """
   @spec new(file_path :: String.t()) :: Agent.on_start()
   def new(file_path) do
     with {:ok, pid} <-
@@ -128,15 +125,11 @@ defmodule Monsoon.Log do
         position: position,
         id_cache: %{},
         write_queue: :queue.new(),
-        pre_flush_position: 0
+        pre_flush_position: position
       }
     end
   end
 
-  @doc """
-  Renames froms path to tos path.
-  Stops the from agent resource and updates lock in to to renamed file path.
-  """
   @spec move(from :: t(), to :: t()) :: t()
   def move(from, to) do
     :ok = :file.rename(to.file_path, from.file_path)
@@ -161,9 +154,6 @@ defmodule Monsoon.Log do
     true = :global.del_lock({file_path, self()}, [node()])
   end
 
-  @doc """
-  Searches for the latest written commit block. Returns decoded locations.
-  """
   @spec get_commit(log :: t()) :: {:ok, nil | non_neg_integer()} | {:error, term()}
   def get_commit(log) do
     Agent.get(log.pid, fn state ->
@@ -180,17 +170,13 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Writes a commit block to the log. 
-  Raises if it fails to write.
-  When written, the file is synced.
-  """
   @spec commit(
           log :: t(),
-          {root_loc :: non_neg_integer(), leaf_links_loc :: non_neg_integer(),
-           metadata_loc :: non_neg_integer()}
+          root_loc :: non_neg_integer(),
+          leaf_links_loc :: non_neg_integer(),
+          metadata_loc :: non_neg_integer()
         ) :: :ok
-  def commit(log, {root_bp, leaf_links_bp, metadata_bp}) do
+  def commit(log, root_bp, leaf_links_bp, metadata_bp) do
     Agent.update(log.pid, fn state ->
       block = encode_commit_block(root_bp, leaf_links_bp, metadata_bp)
 
@@ -205,9 +191,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Encodes and writes a node block to the log. Returns the position of where in the log the node was written. Raises if it fails.
-  """
   @spec put_node(log :: t(), node :: BTree.t()) :: BTree.child()
   def put_node(log, %BTree.Leaf{} = node) do
     Agent.get_and_update(log.pid, fn state ->
@@ -230,10 +213,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Attempts to read the node with corresponding ID. 
-  Returns `{:ok, node}` on a successful read, `{:error, reason}` otherwise.
-  """
   @spec get_node_by_id(log :: t(), id :: binary()) :: {:ok, BTree.t()} | {:error, term()}
   def get_node_by_id(log, id) do
     Agent.get(log.pid, fn state ->
@@ -265,9 +244,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Gets node from file based on location and size. Returns `{:ok, decoded_node}` or `{:error, reason}`.
-  """
   @spec get_node(log :: t(), BTree.child()) :: {:ok, BTree.t()} | {:error, term()}
   def get_node(log, {loc, size}) do
     Agent.get(log.pid, fn state ->
@@ -277,9 +253,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Writes the leaf links to file. Returns a block pointer.
-  """
   @spec put_leaf_links(log :: t(), leaf_links :: map()) :: block_pointer()
   def put_leaf_links(log, leaf_links) do
     Agent.get_and_update(log.pid, fn state ->
@@ -291,9 +264,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Reads the leaf links from file according to provided block pointer. Returns `{:ok, leaf_links}` or `{:error, reason}`.
-  """
   @spec get_leaf_links(log :: t(), leaf_links_bp :: block_pointer()) ::
           {:ok, map()} | {:error, term()}
   def get_leaf_links(log, {loc, size}) do
@@ -304,9 +274,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Enqueues metadata, returning the corresponding block pointer to metadata.
-  """
   @spec put_metadata(log :: t(), metadata :: keyword()) :: block_pointer()
   def put_metadata(log, metadata) do
     Agent.get_and_update(log.pid, fn state ->
@@ -318,9 +285,6 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Reads the metadata from file according to provided block pointer. Returns `{:ok, metadata}` if successful, `{:error, reason}` otherwise.
-  """
   @spec get_metadata(log :: t(), metadata_bp :: block_pointer()) ::
           {:ok, keyword()} | {:error, term()}
   def get_metadata(log, {loc, size}) do
@@ -331,9 +295,7 @@ defmodule Monsoon.Log do
     end)
   end
 
-  @doc """
-  Flushes the write queue to file by joining all blocks in the queue and writes once to file.
-  """
+  @spec flush(log :: t()) :: :ok
   def flush(log) do
     Agent.update(log.pid, fn state ->
       {:ok, position, write_queue} =
@@ -396,8 +358,8 @@ defmodule Monsoon.Log do
         metadata_loc::integer-32,
         metadata_size::integer-32
       >> ->
-        {:ok,
-         {{root_loc, root_size}, {leaf_links_loc, leaf_links_size}, {metadata_loc, metadata_size}}}
+        {:ok, {root_loc, root_size}, {leaf_links_loc, leaf_links_size},
+         {metadata_loc, metadata_size}}
 
       _ ->
         {:error, :unable_to_decode_commit}
@@ -451,7 +413,7 @@ defmodule Monsoon.Log do
     block_size = @metadata_header_size + metadata_size
     no_of_blocks = no_of_blocks(block_size, @block_size)
     content = <<@metadata_key::integer-16, metadata_size::integer-32, enc::binary>>
-    padding_size = no_of_blocks * block_size - block_size
+    padding_size = no_of_blocks * @block_size - block_size
     <<content::binary, 0::size(padding_size)-unit(8)>>
   end
 
@@ -461,7 +423,7 @@ defmodule Monsoon.Log do
         {:ok, :erlang.binary_to_term(enc)}
 
       _ ->
-        {:error, :unable_to_decode_leaf_links}
+        {:error, :unable_to_decode_metadata}
     end
   end
 

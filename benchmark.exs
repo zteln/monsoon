@@ -40,10 +40,18 @@ huge_dataset = BenchmarkHelpers.generate_data(100_000)
 
 Benchee.run(
   %{
-    "put_single" => fn {db, {k, v}} ->
+    "put" => fn {db, %{put: {k, v}} = info} ->
       :ok = Monsoon.put(db, k, v)
-      db
+      {db, info}
     end
+    # "get" => fn {db, %{get: {k, _}} = info} ->
+    #   Monsoon.get(db, k)
+    #   {db, info}
+    # end,
+    # "remove" => fn {db, %{del: {k, _}} = info} ->
+    #   Monsoon.remove(db, k)
+    #   {db, info}
+    # end
   },
   inputs: %{
     "small (100 items)" => {"small", small_dataset},
@@ -58,12 +66,25 @@ Benchee.run(
     {db, data}
   end,
   before_each: fn {db, data} ->
-    {k, v} = Enum.random(data)
-    Monsoon.remove(db, k)
-    {db, {k, v}}
+    {put_k, put_v} = Enum.random(data)
+    {get_k, get_v} = Enum.random(data)
+    {del_k, del_v} = Enum.random(data)
+    Monsoon.remove(db, put_k)
+
+    info = %{
+      put: {put_k, put_v},
+      get: {get_k, get_v},
+      del: {del_k, del_v}
+    }
+
+    {db, info}
   end,
+  # after_each: fn {db, %{del: {k, v}}} = arg ->
+  #   Monsoon.put(db, k, v)
+  #   arg
+  # end,
   after_scenario: fn {db, _} ->
-    %{log: log} = :sys.get_state(db)
+    %{btree: %{log: log}} = :sys.get_state(db)
     Agent.stop(log.pid)
     GenServer.stop(db)
     File.rm_rf(db_dir)
