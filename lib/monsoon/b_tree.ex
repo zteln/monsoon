@@ -3,6 +3,7 @@ defmodule Monsoon.BTree do
 
   """
   alias Monsoon.Log
+  alias Monsoon.LeafLinks
   alias __MODULE__.{Leaf, Interior, Range}
 
   @db_file_name "db.monsoon"
@@ -271,46 +272,9 @@ defmodule Monsoon.BTree do
 
   defp handle_leaf_split(btree, node, idx, key, value) do
     {lnode, split_key, rnode} = Leaf.split(node, idx, {key, value})
-    btree = split_leaf_links(btree, lnode, node, rnode)
+    leaf_links_bp = LeafLinks.split(btree.leaf_links_bp, lnode, node, rnode, btree.log)
+    btree = %{btree | leaf_links_bp: leaf_links_bp}
     {:split, {lnode, split_key, rnode}, btree}
-  end
-
-  defp split_leaf_links(btree, lnode, node, rnode) do
-    {:ok, leaf_links} = Log.get_leaf_links(btree.log, btree.leaf_links_bp)
-
-    {prev, next} = Map.get(leaf_links, node.id)
-
-    leaf_links =
-      case {prev, next} do
-        {nil, nil} ->
-          leaf_links
-
-        {prev, nil} ->
-          {prev_prev, _prev_next} = Map.get(leaf_links, prev)
-
-          leaf_links
-          |> Map.put(prev, {prev_prev, lnode.id})
-
-        {nil, next} ->
-          {_next_prev, next_next} = Map.get(leaf_links, next)
-
-          leaf_links
-          |> Map.put(next, {rnode.id, next_next})
-
-        {prev, next} ->
-          {prev_prev, _prev_next} = Map.get(leaf_links, prev)
-          {_next_prev, next_next} = Map.get(leaf_links, next)
-
-          leaf_links
-          |> Map.put(prev, {prev_prev, lnode.id})
-          |> Map.put(next, {rnode.id, next_next})
-      end
-      |> Map.delete(node.id)
-      |> Map.put(lnode.id, {prev, rnode.id})
-      |> Map.put(rnode.id, {lnode.id, next})
-
-    leaf_links_bp = Log.put_leaf_links(btree.log, leaf_links)
-    %{btree | leaf_links_bp: leaf_links_bp}
   end
 
   @spec remove(btree :: t(), key :: term()) :: t()
@@ -370,17 +334,17 @@ defmodule Monsoon.BTree do
         node = %{node | children: children}
         {:normal, node, btree}
 
-      {:underflow, child, extra} ->
+      {:underflow, child, btree} ->
         if idx < node.keys.size do
           # has right sibling
           rchild_bp = Enum.at(node.children, idx + 1)
-          {:ok, rchild} = Log.get_node(extra.log, rchild_bp)
+          {:ok, rchild} = Log.get_node(btree.log, rchild_bp)
           handle_underflow(btree, idx, child, node, rchild, true)
         else
           # child is last, take left sibling
           idx = idx - 1
           lchild_bp = Enum.at(node.children, idx)
-          {:ok, lchild} = Log.get_node(extra.log, lchild_bp)
+          {:ok, lchild} = Log.get_node(btree.log, lchild_bp)
           handle_underflow(btree, idx, lchild, node, child, false)
         end
     end
@@ -407,7 +371,8 @@ defmodule Monsoon.BTree do
     else
       # sibling is minimal, merge keys
       {mchild, parent} = Leaf.merge(lchild, rchild, parent, idx)
-      btree = merge_leaf_links(btree, lchild, mchild, rchild)
+      leaf_links_bp = LeafLinks.merge(btree.leaf_links_bp, lchild, mchild, rchild, btree.log)
+      btree = %{btree | leaf_links_bp: leaf_links_bp}
       mchild_bp = Log.put_node(btree.log, mchild)
 
       children =
@@ -465,45 +430,6 @@ defmodule Monsoon.BTree do
         {:normal, parent, btree}
       end
     end
-  end
-
-  defp merge_leaf_links(btree, lchild, mchild, rchild) do
-    {:ok, leaf_links} = Log.get_leaf_links(btree.log, btree.leaf_links_bp)
-
-    {prev, _next} = Map.get(leaf_links, lchild.id)
-    {_prev, next} = Map.get(leaf_links, rchild.id)
-
-    leaf_links =
-      case {prev, next} do
-        {nil, nil} ->
-          leaf_links
-
-        {prev, nil} ->
-          {prev_prev, _prev_next} = Map.get(leaf_links, prev)
-
-          leaf_links
-          |> Map.put(prev, {prev_prev, mchild.id})
-
-        {nil, next} ->
-          {_next_prev, next_next} = Map.get(leaf_links, next)
-
-          leaf_links
-          |> Map.put(next, {mchild.id, next_next})
-
-        {prev, next} ->
-          {prev_prev, _prev_next} = Map.get(leaf_links, prev)
-          {_next_prev, next_next} = Map.get(leaf_links, next)
-
-          leaf_links
-          |> Map.put(prev, {prev_prev, mchild.id})
-          |> Map.put(next, {mchild.id, next_next})
-      end
-      |> Map.delete(lchild.id)
-      |> Map.delete(rchild.id)
-      |> Map.put(mchild.id, {prev, next})
-
-    leaf_links_bp = Log.put_leaf_links(btree.log, leaf_links)
-    %{btree | leaf_links_bp: leaf_links_bp}
   end
 
   @spec put_metadata(t(), keyword()) :: t()

@@ -16,6 +16,7 @@ defmodule Monsoon do
     :capacity,
     :btree,
     :tx,
+    write_queue: :queue.new(),
     gen: 0
   ]
 
@@ -25,88 +26,45 @@ defmodule Monsoon do
     GenServer.start_link(__MODULE__, args, name: opts[:name] || __MODULE__)
   end
 
-  @doc """
-  Starts a transaction that is process-bound. 
-  The changes during a transaction are only committed once a transaction ends.
-  This makes the process occupy the writer roler if no other transaction exists already.
-  Starting a transaction will block writes in other processes, though it will not block reads.
-
-  ## Examples
-      
-      :ok = Monsoon.start_transaction(db)
-      spawn(fn -> {:error, :tx_occupied} = Monsoon.start_transaction(db) end)
-      spawn(fn -> {:error, :not_tx_proc} = Monsoon.put(db, :key, :value) end)
-      {:error, :tx_already_started} = Monsoon.start_transaction(db)
-  """
-  @spec start_transaction(GenServer.server()) ::
-          :ok | {:error, :tx_already_started | :tx_occupied}
-  def start_transaction(server \\ __MODULE__) do
-    GenServer.call(server, {:start_transaction, self()})
+  @spec transaction(GenServer.server(), f :: fun(), timeout :: timeout()) ::
+          :ok | {:error, :tx_failed}
+  def transaction(server \\ __MODULE__, f, timeout \\ :infinity) do
+    GenServer.call(server, {:transaction, f, self()}, timeout)
   end
 
-  @doc """
-  Ends a started transaction. 
-  This will commit the changes made during the transaction and unblock other writers.
-
-  ## Examples
-
-    :ok = Monsoon.start_transaction(db)
-    # ...
-    :ok = Monsoon.end_transaction(db)
-  """
-  @spec end_transaction(GenServer.server()) :: :ok | {:error, :not_tx_proc}
-  def end_transaction(server \\ __MODULE__) do
-    GenServer.call(server, {:end_transaction, self()})
+  @spec put_metadata(GenServer.server(), metadata :: keyword(), timeout()) :: :ok
+  def put_metadata(server \\ __MODULE__, metadata, timeout \\ :infinity) do
+    GenServer.call(server, {:put_metadata, metadata, self()}, timeout)
   end
 
-  @doc """
-  Cancels a started transaction. 
-  The changes made during the transaction are not committed and unblocks other writers.
-
-  ## Examples
-
-      :ok = Monsoon.start_transaction(db)
-      # ...
-      :ok = Monsoon.end_transaction(db)
-  """
-  @spec cancel_transaction(GenServer.server()) :: :ok
-  def cancel_transaction(server \\ __MODULE__) do
-    GenServer.call(server, {:cancel_transaction, self()})
+  @spec get_metadata(GenServer.server(), timeout()) :: keyword()
+  def get_metadata(server \\ __MODULE__, timeout \\ :infinity) do
+    GenServer.call(server, {:get_metadata, self()}, timeout)
   end
 
-  @spec put_metadata(GenServer.server(), metadata :: keyword()) :: :ok
-  def put_metadata(server \\ __MODULE__, metadata) do
-    GenServer.call(server, {:put_metadata, metadata, self()})
+  @spec put(GenServer.server(), k :: term(), v :: term(), timeout()) :: :ok
+  def put(server \\ __MODULE__, k, v, timeout \\ :infinity) do
+    GenServer.call(server, {:put, k, v, self()}, timeout)
   end
 
-  @spec get_metadata(GenServer.server()) :: keyword()
-  def get_metadata(server \\ __MODULE__) do
-    GenServer.call(server, {:get_metadata, self()})
+  @spec remove(GenServer.server(), k :: term(), timeout()) :: :ok
+  def remove(server \\ __MODULE__, k, timeout \\ :infinity) do
+    GenServer.call(server, {:remove, k, self()}, timeout)
   end
 
-  @spec put(GenServer.server(), k :: term(), v :: term()) :: :ok
-  def put(server \\ __MODULE__, k, v) do
-    GenServer.call(server, {:put, k, v, self()})
+  @spec get(GenServer.server(), k :: term(), timeout()) :: {:ok, term()} | {:error, nil | term()}
+  def get(server \\ __MODULE__, k, timeout \\ :infinity) do
+    GenServer.call(server, {:get, k, self()}, timeout)
   end
 
-  @spec remove(GenServer.server(), k :: term()) :: :ok
-  def remove(server \\ __MODULE__, k) do
-    GenServer.call(server, {:remove, k, self()})
-  end
+  # @spec select(GenServer.server(), timeout()) :: Stream.t()
+  # def select(server \\ __MODULE__, timeout \\ 5000) do
+  #   GenServer.call(server, {:select, nil, nil}, timeout)
+  # end
 
-  @spec get(GenServer.server(), k :: term()) :: {:ok, term()} | {:error, nil | term()}
-  def get(server \\ __MODULE__, k) do
-    GenServer.call(server, {:get, k, self()})
-  end
-
-  @spec select(GenServer.server()) :: Stream.t()
-  def select(server \\ __MODULE__) do
-    GenServer.call(server, {:select, nil, nil})
-  end
-
-  @spec select(GenServer.server(), lower :: term(), upper :: term()) :: Stream.t()
-  def select(server \\ __MODULE__, lower, upper) do
-    GenServer.call(server, {:select, lower, upper})
+  @spec select(GenServer.server(), lower :: term(), upper :: term(), timeout()) :: Stream.t()
+  def select(server \\ __MODULE__, lower \\ nil, upper \\ nil, timeout \\ :infinity) do
+    GenServer.call(server, {:select, lower, upper}, timeout)
   end
 
   @impl GenServer
@@ -131,90 +89,66 @@ defmodule Monsoon do
   end
 
   @impl GenServer
-  def handle_call({:start_transaction, caller}, _from, state) do
-    case state.tx do
-      {^caller, _tx_btree, _ref} ->
-        {:reply, {:error, :tx_already_started}, state}
-
-      {_tx_holder, _tx_btree, _ref} ->
-        {:reply, {:error, :tx_occupied}, state}
-
-      nil ->
-        ref = Process.monitor(caller)
-        tx = {caller, state.btree, ref}
-        state = %{state | tx: tx}
-        {:reply, :ok, state}
-    end
-  end
-
-  def handle_call({:end_transaction, caller}, _from, state) do
-    case state.tx do
-      {^caller, tx_btree, ref} ->
-        true = Process.demonitor(ref)
-        state = %{state | btree: tx_btree, tx: nil}
-        {:reply, :ok, state, {:continue, :commit}}
-
-      _ ->
-        {:reply, {:error, :not_tx_proc}, state}
-    end
-  end
-
-  def handle_call({:cancel_transaction, caller}, _from, state) do
-    case state.tx do
-      {^caller, _tx_btree, ref} ->
-        true = Process.demonitor(ref)
-        state = %{state | tx: nil}
-        {:reply, :ok, state}
-
-      _ ->
-        {:reply, {:error, :not_tx_proc}, state}
-    end
-  end
-
-  def handle_call({:put, k, v, caller}, _from, state) do
+  def handle_call({:transaction, f, _caller}, from, state) do
     case state.tx do
       nil ->
-        btree = BTree.add(state.btree, k, v)
+        task = op(:tx, f)
+        state = %{state | tx: {state.btree, task, from}}
+        {:noreply, state}
+
+      _ ->
+        write_queue = :queue.in({:tx, f, from}, state.write_queue)
+        state = %{state | write_queue: write_queue}
+        {:noreply, state}
+    end
+  end
+
+  def handle_call({:put, k, v, caller}, from, state) do
+    case state.tx do
+      nil ->
+        btree = op(:put, {state.btree, {k, v}})
         state = %{state | btree: btree}
         {:reply, :ok, state, {:continue, :commit}}
 
-      {^caller, tx_btree, ref} ->
-        tx_btree = BTree.add(tx_btree, k, v)
-        tx = {caller, tx_btree, ref}
-        state = %{state | tx: tx}
+      {btree, %{pid: ^caller} = task, from} ->
+        btree = op(:put, {btree, {k, v}})
+        state = %{state | tx: {btree, task, from}}
         {:reply, :ok, state, {:continue, :commit}}
 
-      {_pid, _, _} ->
-        {:reply, {:error, :not_tx_proc}, state}
+      _ ->
+        write_queue = :queue.in({:put, {k, v}, from}, state.write_queue)
+        state = %{state | write_queue: write_queue}
+        {:noreply, state}
     end
   end
 
-  def handle_call({:remove, k, caller}, _from, state) do
+  def handle_call({:remove, k, caller}, from, state) do
     case state.tx do
       nil ->
-        btree = BTree.remove(state.btree, k)
+        btree = op(:remove, {state.btree, k})
         state = %{state | btree: btree}
         {:reply, :ok, state, {:continue, :commit}}
 
-      {^caller, tx_btree, ref} ->
-        tx_btree = BTree.remove(tx_btree, k)
-        tx = {caller, tx_btree, ref}
-        state = %{state | tx: tx}
+      {btree, %{pid: ^caller} = task, from} ->
+        btree = op(:remove, {btree, k})
+        state = %{state | tx: {btree, task, from}}
         {:reply, :ok, state, {:continue, :commit}}
 
-      {_pid, _, _} ->
-        {:reply, {:error, :not_tx_proc}, state}
+      _ ->
+        write_queue = :queue.in({:remove, k, from}, state.write_queue)
+        state = %{state | write_queue: write_queue}
+        {:noreply, state}
     end
   end
 
   def handle_call({:get, k, caller}, _from, state) do
     res =
       case state.tx do
-        {^caller, tx_btree, _ref} ->
-          BTree.search(tx_btree, k)
+        {btree, %{pid: ^caller}, _from} ->
+          op(:get, {btree, k})
 
         _ ->
-          BTree.search(state.btree, k)
+          op(:get, {state.btree, k})
       end
 
     {:reply, res, state}
@@ -235,38 +169,37 @@ defmodule Monsoon do
       end
     end
 
-    {:reply, BTree.select(info_f, lower, upper), state}
+    reply = op(:select, {info_f, lower, upper})
+    {:reply, reply, state}
   end
 
-  def handle_call({:put_metadata, metadata, caller}, _from, state) do
+  def handle_call({:put_metadata, metadata, caller}, from, state) do
     case state.tx do
-      {^caller, tx_btree, ref} ->
-        tx_btree = BTree.put_metadata(tx_btree, metadata)
-        state = %{state | tx: {caller, tx_btree, ref}}
-        {:reply, :ok, state, {:continue, :commit}}
-
-      {_pid, _, _} ->
-        {:reply, {:error, :not_tx_proc}, state}
-
       nil ->
-        btree = BTree.put_metadata(state.btree, metadata)
+        btree = op(:put_metadata, {state.btree, metadata})
         state = %{state | btree: btree}
         {:reply, :ok, state, {:continue, :commit}}
-    end
 
-    btree = BTree.put_metadata(state.btree, metadata)
-    state = %{state | btree: btree}
-    {:reply, :ok, state}
+      {btree, %{pid: ^caller} = task, from} ->
+        btree = op(:put_metadata, {btree, metadata})
+        state = %{state | tx: {btree, task, from}}
+        {:reply, :ok, state, {:continue, :commit}}
+
+      _ ->
+        write_queue = :queue.in({:put_metadata, metadata, from}, state.write_queue)
+        state = %{state | write_queue: write_queue}
+        {:noreply, state}
+    end
   end
 
   def handle_call({:get_metadata, caller}, _from, state) do
     res =
       case state.tx do
-        {^caller, tx_btree, _ref} ->
-          BTree.get_metadata(tx_btree)
+        {btree, %{pid: ^caller}, _from} ->
+          op(:get_metadata, btree)
 
         _ ->
-          BTree.get_metadata(state.btree)
+          op(:get_metadata, state.btree)
       end
 
     {:reply, res, state}
@@ -275,8 +208,8 @@ defmodule Monsoon do
   @impl GenServer
   def handle_info({:latest_info, pid}, state) do
     case state.tx do
-      {^pid, tx_btree, _ref} ->
-        send(pid, {:latest_info, tx_btree})
+      {btree, %{pid: ^pid}, _from} ->
+        send(pid, {:latest_info, btree})
 
       _ ->
         send(pid, {:latest_info, state.btree})
@@ -285,9 +218,24 @@ defmodule Monsoon do
     {:noreply, state}
   end
 
-  def handle_info({:DOWN, ref, :process, _object, _reason}, state) do
+  def handle_info({_ref, :done}, state) do
+    {btree, _task, from} = state.tx
+    GenServer.reply(from, :ok)
+    state = %{state | tx: nil, btree: btree}
+    {:noreply, state, {:continue, :commit}}
+  end
+
+  def handle_info({_ref, :cancel}, state) do
+    {_btree, _task, from} = state.tx
+    GenServer.reply(from, :ok)
+    state = %{state | tx: nil}
+    {:noreply, state, {:continue, :dequeue}}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     case state.tx do
-      {_pid, _tx_btree, ^ref} ->
+      {_btree, %{pid: ^pid}, from} ->
+        GenServer.reply(from, {:error, :tx_failed})
         state = %{state | tx: nil}
         {:noreply, state}
 
@@ -298,14 +246,85 @@ defmodule Monsoon do
 
   @impl GenServer
   def handle_continue(:commit, state) do
-    {:noreply, commit(state)}
+    {:noreply, commit(state), {:continue, :dequeue}}
+  end
+
+  def handle_continue(:dequeue, state) do
+    state = dequeue(state)
+    {:noreply, state}
+  end
+
+  defp dequeue(state) do
+    case :queue.out(state.write_queue) do
+      {:empty, write_queue} ->
+        %{state | write_queue: write_queue}
+
+      {{:value, {:tx, f, from}}, write_queue} ->
+        task = op(:tx, f)
+        tx = {state.btree, task, from}
+        GenServer.reply(from, :ok)
+        %{state | tx: tx, write_queue: write_queue}
+
+      {{:value, {:put, {k, v}, from}}, write_queue} ->
+        btree = op(:put, {state.btree, {k, v}})
+        GenServer.reply(from, :ok)
+
+        %{state | btree: btree, write_queue: write_queue}
+        |> commit()
+        |> dequeue()
+
+      {{:value, {:remove, k, from}}, write_queue} ->
+        btree = op(:remove, {state.btree, k})
+        GenServer.reply(from, :ok)
+
+        %{state | btree: btree, write_queue: write_queue}
+        |> commit()
+        |> dequeue()
+
+      {{:value, {:put_metadata, metadata, from}}, write_queue} ->
+        btree = op(:put_metadata, {state.btree, metadata})
+        GenServer.reply(from, :ok)
+
+        %{state | btree: btree, write_queue: write_queue}
+        |> commit()
+        |> dequeue()
+    end
+  end
+
+  defp op(code, arg) do
+    case code do
+      :tx ->
+        Task.async(arg)
+
+      :put ->
+        {btree, {k, v}} = arg
+        BTree.add(btree, k, v)
+
+      :remove ->
+        {btree, k} = arg
+        BTree.remove(btree, k)
+
+      :get ->
+        {btree, k} = arg
+        BTree.search(btree, k)
+
+      :select ->
+        {info_f, lower, upper} = arg
+        BTree.select(info_f, lower, upper)
+
+      :put_metadata ->
+        {btree, metadata} = arg
+        BTree.put_metadata(btree, metadata)
+
+      :get_metadata ->
+        BTree.get_metadata(arg)
+    end
   end
 
   defp commit(state) do
     case state.tx do
       nil ->
         :ok = BTree.commit(state.btree)
-        # :ok = Log.commit(state.log, state.btree)
         %{state | gen: state.gen + 1} |> maybe_vacuum()
 
       _ ->
@@ -314,10 +333,8 @@ defmodule Monsoon do
   end
 
   defp maybe_vacuum(state) do
-    if is_nil(state.tx) and state.gen > state.gen_limit do
-      # {:ok, tmp_log} = Log.new(Path.join(state.dir, @db_tmp_file_name))
+    if state.gen > state.gen_limit do
       btree = BTree.copy(state.btree, state.dir)
-      # new_log = Log.move(state.log, tmp_log)
       %{state | gen: 0, btree: btree}
     else
       state

@@ -19,16 +19,26 @@ defmodule Monsoon.BTree.Range do
   end
 
   def add(range, idx, el) do
-    cond do
-      el < range.min ->
-        %{range | min: el, list: [el | range.list], size: range.size + 1}
+    list = List.insert_at(range.list, idx, el)
 
-      el > range.max ->
-        %{range | max: el, list: range.list ++ [el], size: range.size + 1}
+    %{
+      range
+      | list: list,
+        size: range.size + 1,
+        min: if(el < range.min, do: el, else: range.min),
+        max: if(el > range.max, do: el, else: range.max)
+    }
 
-      true ->
-        %{range | list: List.insert_at(range.list, idx, el), size: range.size + 1}
-    end
+    # cond do
+    #   el < range.min ->
+    #     %{range | min: el, list: [el | range.list], size: range.size + 1}
+    #
+    #   el > range.max ->
+    #     %{range | max: el, list: range.list ++ [el], size: range.size + 1}
+    #
+    #   true ->
+    #     %{range | list: List.insert_at(range.list, idx, el), size: range.size + 1}
+    # end
   end
 
   def replace(range, 0, el) do
@@ -67,7 +77,7 @@ defmodule Monsoon.BTree.Range do
     if idx == range.size - 1 do
       %{range | max: List.last(range.list), size: range.size - 1}
     else
-      range
+      %{range | size: range.size - 1}
     end
   end
 
@@ -125,6 +135,11 @@ defmodule Monsoon.BTree.Range do
     Enum.at(range.list, idx)
   end
 
+  def pop_at(%{size: 1} = range, _idx) do
+    [pop] = range.list
+    {%__MODULE__{}, pop}
+  end
+
   def pop_at(range, 0) do
     [pop | [min | _] = list] = range.list
     {%{range | list: list, min: min, size: range.size - 1}, pop}
@@ -178,6 +193,9 @@ defmodule Monsoon.BTree.Range do
 
   def take(range, nil, nil, _trans), do: {:cont, range.list}
 
+  # TODO: consider when either lower or upper is nil 
+  # (nil, upper) -> no lower bound
+  # (lower, nil) -> no upper bound
   def take(range, lower, upper, trans) do
     take_from_list(range.list, lower, upper, trans, [])
   end

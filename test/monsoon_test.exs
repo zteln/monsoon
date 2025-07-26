@@ -140,101 +140,153 @@ defmodule MonsoonTest do
     end
   end
 
-  describe "start_transaction/1,end_transaction/1,cancel_transaction/1" do
-    test "transaction commits when done", c do
-      assert :ok == Monsoon.start_transaction(c.db)
-      assert :ok == Monsoon.put(c.db, 1, "A-1")
-      assert :ok == Monsoon.end_transaction(c.db)
-      assert "A-1" == Monsoon.get(c.db, 1)
+  describe "transaction/2" do
+    test "commits when done", c do
+      assert :ok ==
+               Monsoon.transaction(c.db, fn ->
+                 Monsoon.put(c.db, 1, "v-1")
+                 :done
+               end)
+
+      assert "v-1" == Monsoon.get(c.db, 1)
     end
 
-    test "transaction is process bound", c do
-      ref = make_ref()
-      pid = self()
+    test "does not commit when cancelled", c do
+      assert :ok ==
+               Monsoon.transaction(c.db, fn ->
+                 Monsoon.put(c.db, 1, "v-1")
+                 :cancel
+               end)
 
-      assert :ok == Monsoon.start_transaction(c.db)
-      assert :ok == Monsoon.put(c.db, 1, "A-1")
-
-      spawn(fn ->
-        assert nil == Monsoon.get(c.db, 1)
-        send(pid, {:done, ref})
-      end)
-
-      receive do
-        {:done, ^ref} ->
-          :ok
-      end
-
-      assert "A-1" == Monsoon.get(c.db, 1)
-      assert :ok == Monsoon.end_transaction(c.db)
-      assert "A-1" == Monsoon.get(c.db, 1)
-
-      spawn(fn ->
-        assert "A-1" == Monsoon.get(c.db, 1)
-        send(pid, {:done, ref})
-      end)
-
-      receive do
-        {:done, ^ref} ->
-          :ok
-      end
-    end
-
-    test "canceling a transaction does not update tree", c do
-      assert :ok == Monsoon.start_transaction(c.db)
-      assert :ok == Monsoon.put(c.db, 1, "A-1")
-      assert "A-1" == Monsoon.get(c.db, 1)
-      assert :ok = Monsoon.cancel_transaction(c.db)
       assert nil == Monsoon.get(c.db, 1)
     end
 
-    test "only one transaction at a time", c do
-      ref = make_ref()
-      parent = self()
-      assert :ok == Monsoon.start_transaction(c.db)
-
-      spawn(fn ->
-        assert {:error, :tx_occupied} == Monsoon.start_transaction(c.db)
-        send(parent, {:done, ref})
-      end)
-
-      receive do
-        {:done, ^ref} ->
-          :ok
-      end
-    end
-
-    test "transaction blocks writes", c do
-      ref = make_ref()
-      parent = self()
-      assert :ok == Monsoon.start_transaction(c.db)
-
-      spawn(fn ->
-        assert {:error, :not_tx_proc} == Monsoon.put(c.db, 1, "v-1")
-        send(parent, {:done, ref})
-      end)
-
-      receive do
-        {:done, ^ref} ->
-          :ok
-      end
-    end
-
-    test "transaction does not block reads", c do
-      ref = make_ref()
-      parent = self()
+    test "transactions are atomic", c do
       assert :ok == Monsoon.put(c.db, 1, "v-1")
-      assert :ok == Monsoon.start_transaction(c.db)
 
-      spawn(fn ->
-        assert "v-1" == Monsoon.get(c.db, 1)
-        send(parent, {:done, ref})
-      end)
+      assert :ok ==
+               Monsoon.transaction(fn ->
+                 assert :ok == Monsoon.put(c.db, 1, "v-2")
+                 assert :ok == Monsoon.put(c.db, 2, "v-2")
+                 assert :ok == Monsoon.put(c.db, 3, "v-2")
+                 assert :ok == Monsoon.put(c.db, 4, "v-2")
+                 :cancel
+               end)
+
+      assert "v-1" == Monsoon.get(c.db, 1)
+      assert nil == Monsoon.get(c.db, 2)
+      assert nil == Monsoon.get(c.db, 3)
+      assert nil == Monsoon.get(c.db, 4)
+    end
+
+    test "transactions are isolated", c do
+      parent = self()
+
+      assert :ok == Monsoon.put(c.db, 1, "v-1")
+
+      pid =
+        spawn(fn ->
+          tx_pid =
+            receive do
+              {:start, tx_pid} ->
+                tx_pid
+            end
+
+          assert "v-1" == Monsoon.get(c.db, 1)
+
+          send(tx_pid, :done)
+        end)
+
+      assert :ok ==
+               Monsoon.transaction(fn ->
+                 send(pid, {:start, self()})
+
+                 assert :ok == Monsoon.put(c.db, 1, "v-2")
+
+                 receive do
+                   :done -> :ok
+                 end
+
+                 send(parent, :done)
+
+                 :done
+               end)
 
       receive do
-        {:done, ^ref} ->
+        :done ->
           :ok
       end
+
+      assert "v-2" == Monsoon.get(c.db, 1)
+    end
+
+    test "readers are not blocked by transactions", c do
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          tx_pid =
+            receive do
+              {:start, tx_pid} ->
+                tx_pid
+            end
+
+          assert nil == Monsoon.get(c.db, 1)
+
+          send(tx_pid, :done)
+        end)
+
+      assert :ok ==
+               Monsoon.transaction(fn ->
+                 send(pid, {:start, self()})
+
+                 receive do
+                   :done -> :ok
+                 end
+
+                 send(parent, :done)
+
+                 :done
+               end)
+
+      receive do
+        :done ->
+          :ok
+      end
+    end
+
+    test "writers are blocked until transaction finishes", c do
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          receive do
+            :start ->
+              :ok
+          end
+
+          assert :ok == Monsoon.put(c.db, 1, "v-2")
+
+          receive do
+            :end ->
+              send(parent, :cont)
+          end
+        end)
+
+      assert :ok ==
+               Monsoon.transaction(c.db, fn ->
+                 send(pid, :start)
+                 Monsoon.put(c.db, 1, "v-1")
+                 send(pid, :end)
+                 :done
+               end)
+
+      receive do
+        :cont ->
+          :ok
+      end
+
+      assert "v-2" == Monsoon.get(c.db, 1)
     end
   end
 end
